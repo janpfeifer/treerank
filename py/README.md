@@ -39,6 +39,35 @@ python3 py/tokenize_sentences.py --model bert-base-uncased "Hello world"
 echo "This is a test sentence." | python3 py/tokenize_sentences.py
 ```
 
+### `embed_sentence.py`
+
+Generates embeddings for sentences using Hugging Face models. Uses last-token pooling and normalization.
+
+#### Usage
+
+```bash
+python3 py/embed_sentence.py [sentences...] [--model MODEL_ID] [--query]
+```
+
+#### Examples
+
+**Generate embeddings for sentences:**
+```bash
+python3 py/embed_sentence.py "Hello world" "Machine learning is fun."
+```
+
+**Save embedding to a file:**
+```bash
+python3 py/embed_sentence.py --output vector.txt "Example sentence"
+```
+
+**Generate embeddings for a query (with instruction prefix):**
+```bash
+python3 py/embed_sentence.py --query "How does tokenization work?"
+```
+
 #### Configuration
 - `--model`: The Hugging Face model ID (default: `tencent/KaLM-Embedding-Gemma3-12B-2511`).
+- `--query`: If set, applies the recommended instruction prefix for the default model.
+- `--output`: File path to write the full embedding (one value per line). Suppresses full embedding output in stdout.
 - `sentences`: Positional arguments for sentences. If omitted, the script reads from standard input.
