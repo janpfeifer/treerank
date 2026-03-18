@@ -1,3 +1,10 @@
+// kalmgemma3 package loads the KaLM-Gemma3 model configuration and weights.
+//
+// See KaLM embedding site [1] and HuggingFace model repo [2]. You'll find
+// links to the papers in either these locations.
+//
+// [1] https://kalm-embedding.github.io/
+// [2] https://huggingface.co/tencent/KaLM-Embedding-Gemma3-12B-2511
 package kalmgemma3
 
 import (
