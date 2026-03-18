@@ -9,12 +9,12 @@ import (
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
 	"github.com/gomlx/gomlx/pkg/support/xslices"
+	"github.com/janpfeifer/treerank/pkg/kalmgemma3"
 	"k8s.io/klog/v2"
 )
 
 var (
-	flagRepository = flag.String("repo", "tencent/KaLM-Embedding-Gemma3-12B-2511",
-		"Path to the repository")
+	flagRepository = flag.String("repo", kalmgemma3.Repository, "Path to the repository")
 )
 
 func main() {
