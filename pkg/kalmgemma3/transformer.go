@@ -1,6 +1,7 @@
 package kalmgemma3
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/gomlx/gomlx/pkg/core/graph"
@@ -20,9 +21,9 @@ func (m *Model) WithCausalMask(useCausalMask bool) *Model {
 	return m
 }
 
-// BuildGraph takes the input tokens and creates the GoMLX graph for the embedding layer.
+// BuildAllLayersGraph takes the input tokens and creates the GoMLX graph for the embedding layer.
 // It returns an array of []*graph.Node containing [embeddings, layer0, (layer1, etc...)].
-func (m *Model) BuildGraph(ctx *context.Context, tokens *graph.Node) (outputs []*graph.Node) {
+func (m *Model) BuildAllLayersGraph(ctx *context.Context, tokens *graph.Node) (outputs []*graph.Node) {
 	g := tokens.Graph()
 
 	// The embedding weight name mapped from the HuggingFace safetensors
@@ -46,8 +47,7 @@ func (m *Model) BuildGraph(ctx *context.Context, tokens *graph.Node) (outputs []
 	scale := math.Sqrt(float64(m.Config.HiddenSize))
 
 	// Cast scale to the exact dtype of the embeddings
-	scaleNode := graph.Scalar(g, embeddings.DType(), scale)
-	embeddings = graph.Mul(embeddings, scaleNode)
+	embeddings = graph.MulScalar(embeddings, scale)
 
 	// Output index 0 is token embeddings
 	outputs = append(outputs, embeddings)
@@ -75,13 +75,25 @@ func (m *Model) BuildGraph(ctx *context.Context, tokens *graph.Node) (outputs []
 		WithBias(false).
 		WithCausalMask(m.useCausalMask)
 
-	// Execute layer 0
-	layer0 := tm.ForwardLayer(ctx.In("layer_0"), embeddings, 0, false, 0)
-	outputs = append(outputs, layer0)
+	x := embeddings
+	for layerIdx := 0; layerIdx < m.Config.NumHiddenLayers; layerIdx++ {
+		layerCtx := ctx.In(fmt.Sprintf("layer_%d", layerIdx))
+		x = tm.ForwardLayer(layerCtx, x, layerIdx, false, 0)
 
-	// Execute layer 1
-	layer1 := tm.ForwardLayer(ctx.In("layer_1"), layer0, 1, false, 0)
-	outputs = append(outputs, layer1)
+		// For the very last layer, huggingface returns the normalized hidden state in hidden_states[-1]
+		if layerIdx == m.Config.NumHiddenLayers-1 {
+			x = layers.RMSNorm(ctx.In("final_norm"), x).WithEpsilon(m.Config.RMSNormEps).WithScaleOffset(1.0).Done()
+		}
+
+		outputs = append(outputs, x)
+	}
 
 	return outputs
+}
+
+// BuildGraph takes the input tokens and creates the GoMLX graph for the model.
+// It returns the final normalized output layer.
+func (m *Model) BuildGraph(ctx *context.Context, tokens *graph.Node) *graph.Node {
+	outputs := m.BuildAllLayersGraph(ctx, tokens)
+	return outputs[len(outputs)-1]
 }

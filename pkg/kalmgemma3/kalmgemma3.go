@@ -184,7 +184,6 @@ func (m *Model) LoadContext(ctx *context.Context) {
 		if err != nil {
 			panic(fmt.Errorf("failed to iterate tensors: %w", err))
 		}
-
 		scopePath, varName, ok := mapTensorName(tensorAndName.Name)
 		if !ok {
 			fmt.Printf("Skipping unmapped tensor: %s\n", tensorAndName.Name)
