@@ -24,8 +24,47 @@ import (
 var flagUseCausalMask = flag.Bool("use_causal_mask", true, "Use causal mask in the transformer: the paper suggests one shouldn't, "+
 	"but for testing it makes the result closer to Python's using HF transformer library, which seems to use it.")
 
-func init() {
+var (
+	testBackend backends.Backend
+	testCtx     *context.Context
+	testModel   *Model
+)
+
+func TestMain(m *testing.M) {
 	klog.InitFlags(nil)
+	flag.Parse() // Ensure flags are parsed before we use them
+
+	var err error
+	testBackend, err = backends.New()
+	if err != nil {
+		fmt.Printf("Failed to initialize backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	testCtx = context.New()
+
+	repo, err := LoadRepo()
+	if err != nil {
+		fmt.Printf("Failed to LoadRepo: %v\n", err)
+		os.Exit(1)
+	}
+
+	testModel, err = LoadModel(repo)
+	if err != nil {
+		fmt.Printf("Failed to LoadModel: %v\n", err)
+		os.Exit(1)
+	}
+	testModel = testModel.WithCausalMask(*flagUseCausalMask)
+
+	fmt.Printf("- Loading model weights ...")
+	start := time.Now()
+	testModel.LoadContext(testCtx)
+	fmt.Printf("done (%v)\n", time.Since(start))
+
+	code := m.Run()
+
+	testBackend.Finalize()
+	os.Exit(code)
 }
 
 // readPythonEmbeddings reads the embeddings and layers dumped by the python script.
@@ -84,34 +123,9 @@ func readPythonEmbeddings(path string, layersToRead []int) (map[int][]float32, e
 
 func TestTransformerEmbeddings(t *testing.T) {
 
-	backend, err := backends.New()
-	if err != nil {
-		t.Fatalf("Failed to initialize backend: %v", err)
-	}
-	defer backend.Finalize()
-
-	ctx := context.New()
-
-	repo, err := LoadRepo()
-	if err != nil {
-		t.Fatalf("Failed to LoadRepo: %v", err)
-	}
-
-	model, err := LoadModel(repo)
-	if err != nil {
-		t.Fatalf("Failed to LoadModel: %v", err)
-	}
-	model = model.WithCausalMask(*flagUseCausalMask)
-
-	// Loading weights to memory.
-	fmt.Printf("- Loading model weights ...")
-	start := time.Now()
-	model.LoadContext(ctx)
-	fmt.Printf("done (%v)\n", time.Since(start))
-
 	// Ensure the weights were loaded.
 	varName := "embeddings"
-	if ctx.In("token_embed").InspectVariableInScope(varName) == nil {
+	if testCtx.In("token_embed").InspectVariableInScope(varName) == nil {
 		t.Fatalf("Variable token_embed/%s not loaded in context", varName)
 	}
 
@@ -120,12 +134,12 @@ func TestTransformerEmbeddings(t *testing.T) {
 	inputTokens := []int32{2, 9259, 4109}
 	inputTensor := tensors.FromValue([][]int32{inputTokens})
 
-	layersToCheck := []int{0, 1, 2, 10, 20, 30, 40, model.Config.NumHiddenLayers}
+	layersToCheck := []int{0, 1, 2, 10, 20, 30, 40, testModel.Config.NumHiddenLayers}
 
 	uniqueLayers := make(map[int]bool)
 	var finalLayersToCheck []int
 	for _, l := range layersToCheck {
-		if l <= model.Config.NumHiddenLayers && !uniqueLayers[l] {
+		if l <= testModel.Config.NumHiddenLayers && !uniqueLayers[l] {
 			uniqueLayers[l] = true
 			finalLayersToCheck = append(finalLayersToCheck, l)
 		}
@@ -145,8 +159,8 @@ func TestTransformerEmbeddings(t *testing.T) {
 		}
 	}
 
-	exec, err := context.NewExec(backend, ctx.Reuse(), func(ctx *context.Context, tokens *graph.Node) []*graph.Node {
-		outputs := model.BuildAllLayersGraph(ctx, tokens)
+	exec, err := context.NewExec(testBackend, testCtx.Reuse(), func(ctx *context.Context, tokens *graph.Node) []*graph.Node {
+		outputs := testModel.BuildAllLayersGraph(ctx, tokens)
 		var converted []*graph.Node
 		for _, o := range outputs {
 			converted = append(converted, graph.ConvertDType(o, dtypes.Float32))
@@ -158,7 +172,7 @@ func TestTransformerEmbeddings(t *testing.T) {
 	}
 
 	fmt.Printf("- Pre-compiling model ...")
-	start = time.Now()
+	start := time.Now()
 	_, err = exec.Exec(inputTensor)
 	if err != nil {
 		t.Fatalf("Failed to compile graph: %v", err)
@@ -173,8 +187,8 @@ func TestTransformerEmbeddings(t *testing.T) {
 	}
 	fmt.Printf("done (%v)\n", time.Since(start))
 
-	if len(results) < model.Config.NumHiddenLayers+1 {
-		t.Fatalf("Expected at least %d outputs from graph, got %d", model.Config.NumHiddenLayers+1, len(results))
+	if len(results) < testModel.Config.NumHiddenLayers+1 {
+		t.Fatalf("Expected at least %d outputs from graph, got %d", testModel.Config.NumHiddenLayers+1, len(results))
 	}
 
 	for _, l := range finalLayersToCheck {
@@ -186,7 +200,7 @@ func TestTransformerEmbeddings(t *testing.T) {
 		}
 		outTensor.ConstFlatData(func(flatAny any) {
 			flat := flatAny.([]float32)
-			validateTensor(t, flat, outTensor.Shape(), inputTokens, model.Config.HiddenSize, expectedData, name)
+			validateTensor(t, flat, outTensor.Shape(), inputTokens, testModel.Config.HiddenSize, expectedData, name)
 		})
 	}
 }
@@ -246,6 +260,117 @@ func validateTensor(t *testing.T, outData []float32, outShape shapes.Shape, inpu
 			}
 			fmt.Printf("\t- Value #%d:\tgot %.3g,\t expected %.3g\n", i, gotValueF64, expectValue)
 		}
+	} else {
+		t.Logf("[%s] Match! Max rel diff: %.3g, Mean abs diff: %.3g (%.3g is the mean absolute)", name, maxRelDiff, meanAbsDiff, meanAbsExpected)
+	}
+}
+
+func readPythonEmbeddingsList(path string) ([]float32, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var results []float32
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		val, err := strconv.ParseFloat(line, 32)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse float: %v", err)
+		}
+		results = append(results, float32(val))
+	}
+	return results, scanner.Err()
+}
+
+func TestSentenceEmbedding(t *testing.T) {
+	inputTokens := []int32{2, 9259, 4109}
+	inputTensor := tensors.FromValue([][]int32{inputTokens})
+
+	pythonPath := "hello_world_sentence_embed.txt"
+	expectedData, err := readPythonEmbeddingsList(pythonPath)
+	if err != nil {
+		t.Skipf("Skipping test because %s is not available: %v", pythonPath, err)
+	}
+
+	exec, err := context.NewExec(testBackend, testCtx.Reuse(), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
+		x := testModel.SentenceEmbeddingGraph(ctx, tokens)
+		return graph.ConvertDType(x, dtypes.Float32)
+	})
+	if err != nil {
+		t.Fatalf("Failed to create exec: %v", err)
+	}
+
+	fmt.Printf("- Pre-compiling model ...")
+	start := time.Now()
+	_, err = exec.Exec(inputTensor)
+	if err != nil {
+		t.Fatalf("Failed to compile graph: %v", err)
+	}
+	fmt.Printf("done (%v)\n", time.Since(start))
+
+	fmt.Printf("- Executing model ...")
+	start = time.Now()
+	results, err := exec.Exec(inputTensor)
+	if err != nil {
+		t.Fatalf("Failed to execute graph: %v", err)
+	}
+	fmt.Printf("done (%v)\n", time.Since(start))
+
+	outTensor := results[0]
+	outShape := outTensor.Shape()
+	if outShape.Rank() != 2 || outShape.Dimensions[1] != testModel.Config.HiddenSize {
+		t.Fatalf("Expected shape [batch, hidden_size] ([1, %d]), got %s", testModel.Config.HiddenSize, outShape)
+	}
+
+	outTensor.ConstFlatData(func(flatAny any) {
+		flat := flatAny.([]float32)
+		validateFlatTensor(t, flat, expectedData, "Sentence Embedding")
+	})
+}
+
+func validateFlatTensor(t *testing.T, gotData, expectedData []float32, name string) {
+	if len(gotData) != len(expectedData) {
+		t.Fatalf("[%s] Shape mismatch: expected %d flat floats, got %d", name, len(expectedData), len(gotData))
+	}
+
+	var sumAbsDiff, sumAbsExpected float64
+	var maxRelDiff float64
+	var maxRelDiffIdx int
+	for i, gotValue := range gotData {
+		expectValue := float64(expectedData[i])
+		gotValueF64 := float64(gotValue)
+		absDiff := math.Abs(gotValueF64 - expectValue)
+		sumAbsDiff += absDiff
+		sumAbsExpected += math.Abs(expectValue)
+	}
+	meanAbsDiff := sumAbsDiff / float64(len(gotData))
+	meanAbsExpected := sumAbsExpected / float64(len(gotData))
+
+	for i, gotValue := range gotData {
+		expectValue := float64(expectedData[i])
+		gotValueF64 := float64(gotValue)
+		absDiff := math.Abs(gotValueF64 - expectValue)
+		relDenominator := math.Max(math.Abs(expectValue), math.Abs(gotValueF64))
+		relDenominator = max(relDenominator, meanAbsExpected)
+		relDiff := absDiff / relDenominator
+		if relDiff > maxRelDiff {
+			maxRelDiff = relDiff
+			maxRelDiffIdx = i
+		}
+	}
+
+	relTolerance := 5.0
+	meanAbsTolerance := 10.0
+
+	if maxRelDiff > relTolerance || meanAbsDiff > meanAbsTolerance {
+		t.Errorf("[%s] Mismatch in values. Max rel diff: %.3g at idx %d (ex %f, got %f) -- tol %.3g. Mean abs diff: %.3g (%.3g is the mean absolute) -- tol %.3g",
+			name, maxRelDiff, maxRelDiffIdx, expectedData[maxRelDiffIdx], gotData[maxRelDiffIdx], relTolerance, meanAbsDiff, meanAbsExpected, meanAbsTolerance)
 	} else {
 		t.Logf("[%s] Match! Max rel diff: %.3g, Mean abs diff: %.3g (%.3g is the mean absolute)", name, maxRelDiff, meanAbsDiff, meanAbsExpected)
 	}

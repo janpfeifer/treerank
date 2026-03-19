@@ -91,9 +91,81 @@ func (m *Model) BuildAllLayersGraph(ctx *context.Context, tokens *graph.Node) (o
 	return outputs
 }
 
+// SentenceEmbeddingGraph builds the equivalent of the sentence_transformers pipeline.
+// It uses BuildAllLayersGraph for the base model, and then applies pooling and normalization
+// layers sequentially according to the modules.json configuration.
+func (m *Model) SentenceEmbeddingGraph(ctx *context.Context, tokens *graph.Node) *graph.Node {
+	var x *graph.Node
+
+	for _, mod := range m.Modules {
+		switch mod.Type {
+		case "sentence_transformers.models.Transformer":
+			// The base transformer output is the list of layer outputs.
+			// The last item is the final hidden state.
+			outputs := m.BuildAllLayersGraph(ctx, tokens)
+			x = outputs[len(outputs)-1]
+
+		case "sentence_transformers.models.Pooling":
+			if x == nil {
+				exceptions.Panicf("pooling module found before transformer module")
+			}
+			x = m.ApplySentencePooling(ctx, x, tokens)
+
+		case "sentence_transformers.models.Normalize":
+			if x == nil {
+				exceptions.Panicf("normalize module found before transformer module")
+			}
+			// Apply L2 normalization: x = x / max(norm(x), eps)
+			// Compute norm along the final dimension (hidden_size)
+			norm := graph.Sqrt(graph.ReduceSum(graph.Square(x), -1))
+			eps := graph.Scalar(x.Graph(), norm.DType(), 1e-12)
+			norm = graph.Max(norm, eps)
+			
+			// Expand norm back to [batch, 1] for broadcasting against [batch, hidden_size]
+			norm = graph.ExpandAxes(norm, -1)
+			x = graph.Div(x, norm)
+
+		default:
+			fmt.Printf("Warning: unknown module type %q in sentence transformer pipeline. Ignoring.\n", mod.Type)
+		}
+	}
+
+	if x == nil {
+		exceptions.Panicf("sentence transformer pipeline did not produce any output. Check modules.json")
+	}
+
+	return x
+}
+
+// ApplySentencePooling applies the configured pooling function to the hidden states.
+func (m *Model) ApplySentencePooling(ctx *context.Context, hiddenStates, tokens *graph.Node) *graph.Node {
+	cfg := &m.PoolingConfig
+	
+	if cfg.PoolingModeLastToken {
+		// In Hugging Face, sentence transformers typically use the attention mask to find the last valid token.
+		// Since we don't handle padding explicitly through an attention mask yet, we take the physical
+		// last token in the sequence. For left-padded or unpadded sequences, this is correct.
+		seqLen := hiddenStates.Shape().Dimensions[1]
+		if seqLen == -1 {
+			// If sequence length is unknown at translation time, we could use graph.Shape(hiddenStates) 
+			// and graph.Slice dynamically. For simplicity assuming known seq length for now.
+			exceptions.Panicf("PoolingModeLastToken requires sequence length to be known at trace time")
+		}
+		sliced := graph.Slice(hiddenStates, graph.AxisRange(), graph.AxisRange(seqLen-1, seqLen))
+		return graph.Squeeze(sliced, 1) // [batch, 1, hidden] -> [batch, hidden]
+	}
+
+	if cfg.PoolingModeMeanTokens {
+		// Plain mean pooling over the sequence tokens (assuming no padding for now).
+		return graph.ReduceMean(hiddenStates, 1)
+	}
+
+	exceptions.Panicf("no supported pooling mode enabled in PoolingConfig: %+v", cfg)
+	return nil
+}
+
 // BuildGraph takes the input tokens and creates the GoMLX graph for the model.
-// It returns the final normalized output layer.
+// It returns the final sentence embeddings.
 func (m *Model) BuildGraph(ctx *context.Context, tokens *graph.Node) *graph.Node {
-	outputs := m.BuildAllLayersGraph(ctx, tokens)
-	return outputs[len(outputs)-1]
+	return m.SentenceEmbeddingGraph(ctx, tokens)
 }

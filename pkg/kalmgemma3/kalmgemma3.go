@@ -114,6 +114,7 @@ type PoolingConfig struct {
 	PoolingModeMeanTokens bool           `json:"pooling_mode_mean_tokens"`
 	PoolingModeClsToken   bool           `json:"pooling_mode_cls_token"`
 	PoolingModeMaxTokens  bool           `json:"pooling_mode_max_tokens"`
+	PoolingModeLastToken  bool           `json:"pooling_mode_lasttoken"`
 	Extra                 map[string]any `json:"-"`
 }
 
