@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gomlx/go-huggingface/models/transformer"
 	"github.com/gomlx/gomlx/backends"
 	_ "github.com/gomlx/gomlx/backends/default"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
@@ -27,7 +28,7 @@ var flagUseCausalMask = flag.Bool("use_causal_mask", true, "Use causal mask in t
 var (
 	testBackend backends.Backend
 	testCtx     *context.Context
-	testModel   *Model
+	testModel   *transformer.Model
 )
 
 func TestMain(m *testing.M) {
@@ -49,18 +50,35 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	testModel, err = LoadModel(repo)
+	testModel, err = transformer.LoadModel(repo)
 	if err != nil {
 		fmt.Printf("Failed to LoadModel: %v\n", err)
 		os.Exit(1)
 	}
 	testModel = testModel.WithCausalMask(*flagUseCausalMask)
 
+	fmt.Printf("%s\n\n", testModel.Description())
+
 	fmt.Printf("- Loading model weights ...")
 	start := time.Now()
 	testModel.LoadContext(testCtx)
 	fmt.Printf("done (%v)\n", time.Since(start))
 
+	fmt.Printf("- Upload variables to device ...")
+	start = time.Now()
+	for v := range testCtx.IterVariables() {
+		t, err := v.Value()
+		if err != nil {
+			klog.Fatalf("Failed to get variable %q value: %+v", v.Name(), err)
+		}
+		if err = t.MaterializeOnDevice(testBackend, false, 0); err != nil {
+			klog.Fatalf("Failed to materialize variable %q on device: %+v", v.Name(), err)
+		}
+		t.FinalizeLocal()
+	}
+	fmt.Printf("done (%v)\n", time.Since(start))
+
+	// Run the tests
 	code := m.Run()
 
 	testBackend.Finalize()
@@ -298,7 +316,7 @@ func TestSentenceEmbedding(t *testing.T) {
 		t.Skipf("Skipping test because %s is not available: %v", pythonPath, err)
 	}
 
-	exec, err := context.NewExec(testBackend, testCtx.Reuse(), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
+	exec, err := context.NewExec(testBackend, testCtx.Checked(false), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
 		x := testModel.SentenceEmbeddingGraph(ctx, tokens)
 		return graph.ConvertDType(x, dtypes.Float32)
 	})

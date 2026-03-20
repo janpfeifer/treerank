@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/gomlx/go-huggingface/models/transformer"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/janpfeifer/treerank/pkg/kalmgemma3"
 	"k8s.io/klog/v2"
@@ -31,7 +32,7 @@ func main() {
 	fmt.Println("Tokenizer loaded successfully.")
 
 	fmt.Println("Loading model configurations...")
-	model, err := kalmgemma3.LoadModel(repo)
+	model, err := transformer.LoadModel(repo)
 	if err != nil {
 		klog.Fatalf("Failed to load model configs: %v", err)
 	}
