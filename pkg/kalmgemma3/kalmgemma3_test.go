@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -75,6 +76,10 @@ func TestMain(m *testing.M) {
 			klog.Fatalf("Failed to materialize variable %q on device: %+v", v.Name(), err)
 		}
 		t.FinalizeLocal()
+		runtime.GC()
+	}
+	for range 3 {
+		runtime.GC()
 	}
 	fmt.Printf("done (%v)\n", time.Since(start))
 
