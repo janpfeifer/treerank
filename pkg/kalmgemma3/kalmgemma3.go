@@ -15,6 +15,13 @@ import (
 )
 
 const (
+	// Repository for KaLM-Embedding-Gemma3-12B-2511.
+	//
+	// This is an embedding model, not a language model. It is trained to produce
+	// embeddings for sentences, not to generate text.
+	//
+	// Remember to set Model.WithCausalMask(false) when using this model.
+	// (The default is set to use causal mask, but the model shouldn't use it)
 	Repository = "tencent/KaLM-Embedding-Gemma3-12B-2511"
 )
 
