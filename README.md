@@ -1,2 +1,2 @@
 # treerank
-Experiments using trees to rank
+Experiments using trees to rank / retrieve content.
