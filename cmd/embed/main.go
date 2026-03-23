@@ -3,10 +3,15 @@ package main
 import (
 	"flag"
 	"fmt"
+	"strings"
+	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/gomlx/go-huggingface/models/transformer"
 	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/support/xslices"
 	"github.com/janpfeifer/treerank/pkg/kalmgemma3"
+	"github.com/sugarme/tokenizer"
 	"k8s.io/klog/v2"
 )
 
@@ -22,50 +27,44 @@ func main() {
 	if err != nil {
 		klog.Fatalf("Failed to init repo: %v", err)
 	}
-
-	fmt.Println("Loading tokenizer...")
-	tokenizer, err := kalmgemma3.LoadTokenizer(repo)
-	if err != nil {
-		klog.Fatalf("Failed to load tokenizer: %v", err)
-	}
-	_ = tokenizer // mark as used
-	fmt.Println("Tokenizer loaded successfully.")
-
-	fmt.Println("Loading model configurations...")
-	model, err := transformer.LoadModel(repo)
-	if err != nil {
-		klog.Fatalf("Failed to load model configs: %v", err)
-	}
-
-	fmt.Println("\n=== Configurations ===")
-	fmt.Println("--- Config.json ---")
-	fmt.Printf("%+v\n", model.Config)
-
-	fmt.Println("\n--- SentenceTransformerConfig ---")
-	fmt.Printf("%+v\n", model.SentenceTransformerConfig)
-
-	fmt.Println("\n--- Modules ---")
-	for _, mod := range model.Modules {
-		fmt.Printf("%+v\n", mod)
-	}
-
-	fmt.Println("\n--- TaskPrompts ---")
-	fmt.Printf("%+v\n", model.TaskPrompts)
-
-	fmt.Println("\n--- PoolingConfig ---")
-	fmt.Printf("%+v\n", model.PoolingConfig)
-
-	fmt.Println("\n=== Loading Variables into Context ===")
-	ctx := context.New()
-	model.LoadContext(ctx)
-
-	fmt.Println("\nVariables loaded into context:")
-	count := 0
-	ctx.EnumerateVariables(func(v *context.Variable) {
-		fmt.Printf("  %s: %s\n", v.Name(), v.Shape())
-		count++
+	model := mustRunWithElapsedTime("Loading model configurations", func() (*transformer.Model, error) {
+		return transformer.LoadModel(repo)
 	})
-	fmt.Printf("\nTotal variables loaded: %d\n", count)
+	tokenizer := mustRunWithElapsedTime("Loading tokenizer", func() (tokenizer.Tokenizer, error) {
+		return model.GetTokenizer()
+	})
+
+	// Create context with model variables.
+	ctx := context.New()
+	mustRunWithElapsedTime("Loading variables into context", func() (any, error) {
+		return nil, model.LoadContext(ctx)
+	})
+
+	// Loop over sentences:
+	for ii, sentence := range flag.Args() {
+		fmt.Printf("Sentence %d: %s\n", ii+1, sentence)
+		tokenIDs := tokenizer.EncodeWithOptions(sentence, true)
+		style := lipgloss.NewStyle().Underline(true)
+		tokens := xslices.Map(tokenIDs, func(tokenID int) string {
+			text := tokenizer.Decode([]int{tokenID})
+			text = strings.ReplaceAll(text, " ", style.Render(" "))
+			text = strings.ReplaceAll(text, " ", style.Render(" "))
+			return text
+		})
+		fmt.Printf("Tokens: \"%s\"\n", strings.Join(tokens, "\", \""))
+		fmt.Printf("Token IDs: %v\n", tokenIDs)
+	}
 
 	fmt.Println("\nDone.")
+}
+
+func mustRunWithElapsedTime[T any](name string, f func() (T, error)) T {
+	fmt.Printf("%s...", name)
+	start := time.Now()
+	ret, err := f()
+	if err != nil {
+		klog.Fatalf("failed: %v\n", err)
+	}
+	fmt.Printf("done (%v)\n", time.Since(start))
+	return ret
 }

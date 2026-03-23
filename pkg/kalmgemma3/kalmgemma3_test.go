@@ -20,6 +20,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/stretchr/testify/require"
 	"k8s.io/klog/v2"
 )
 
@@ -62,7 +63,8 @@ func TestMain(m *testing.M) {
 
 	fmt.Printf("- Loading model weights ...")
 	start := time.Now()
-	testModel.LoadContext(testCtx)
+	err = testModel.LoadContext(testCtx)
+	require.NoError(t, err)
 	fmt.Printf("done (%v)\n", time.Since(start))
 
 	fmt.Printf("- Upload variables to device ...")

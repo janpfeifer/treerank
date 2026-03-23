@@ -11,7 +11,6 @@ import (
 	"fmt"
 
 	"github.com/gomlx/go-huggingface/hub"
-	"github.com/gomlx/go-huggingface/tokenizers"
 )
 
 const (
@@ -32,13 +31,4 @@ func LoadRepo() (*hub.Repo, error) {
 		return nil, fmt.Errorf("failed to get repo info: %w", err)
 	}
 	return repo, nil
-}
-
-// LoadTokenizer creates a Tokenizer from the given repository.
-func LoadTokenizer(repo *hub.Repo) (tokenizers.Tokenizer, error) {
-	tokenizer, err := tokenizers.New(repo)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tokenizer: %w", err)
-	}
-	return tokenizer, nil
 }
