@@ -20,18 +20,32 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
-	"github.com/stretchr/testify/require"
 	"k8s.io/klog/v2"
 )
 
-var flagUseCausalMask = flag.Bool("use_causal_mask", true, "Use causal mask in the transformer: the paper suggests one shouldn't, "+
-	"but for testing it makes the result closer to Python's using HF transformer library, which seems to use it.")
+var (
+	flagUseCausalMask = flag.Bool("use_causal_mask", true, "Use causal mask in the transformer: the paper suggests one shouldn't, "+
+		"but for testing it makes the result closer to Python's using HF transformer library, which seems to use it.")
+	flagListPrompts = flag.Bool("prompts", false, "During initialization lists prompts from the dataset and exit immediately.")
+)
 
 var (
 	testBackend backends.Backend
 	testCtx     *context.Context
 	testModel   *transformer.Model
 )
+
+func must(err error) {
+	if err != nil {
+		klog.Errorf("Must failed: %+v", err)
+		panic(err)
+	}
+}
+
+func must1[T any](v T, err error) T {
+	must(err)
+	return v
+}
 
 func TestMain(m *testing.M) {
 	klog.InitFlags(nil)
@@ -58,13 +72,20 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	testModel = testModel.WithCausalMask(*flagUseCausalMask)
+	if *flagListPrompts {
+		fmt.Printf("Prompts:\n")
+		for _, taskCode := range testModel.RegisteredPromptTasks() {
+			prompt := testModel.GetTaskPrompt(taskCode)
+			fmt.Printf("  [%s]:\n    %s\n\n", taskCode, prompt)
+		}
+		os.Exit(0)
+	}
 
 	fmt.Printf("%s\n\n", testModel.Description())
 
 	fmt.Printf("- Loading model weights ...")
 	start := time.Now()
-	err = testModel.LoadContext(testCtx)
-	require.NoError(t, err)
+	must(testModel.LoadContext(testCtx))
 	fmt.Printf("done (%v)\n", time.Since(start))
 
 	fmt.Printf("- Upload variables to device ...")
@@ -147,7 +168,6 @@ func readPythonEmbeddings(path string, layersToRead []int) (map[int][]float32, e
 }
 
 func TestTransformerEmbeddings(t *testing.T) {
-
 	// Ensure the weights were loaded.
 	varName := "embeddings"
 	if testCtx.In("token_embed").InspectVariableInScope(varName) == nil {
@@ -185,9 +205,9 @@ func TestTransformerEmbeddings(t *testing.T) {
 	}
 
 	exec, err := context.NewExec(testBackend, testCtx.Reuse(), func(ctx *context.Context, tokens *graph.Node) []*graph.Node {
-		outputs := testModel.BuildAllLayersGraph(ctx, tokens)
+		_, allLayers := testModel.AllLayers(ctx, tokens, nil)
 		var converted []*graph.Node
-		for _, o := range outputs {
+		for _, o := range allLayers {
 			converted = append(converted, graph.ConvertDType(o, dtypes.Float32))
 		}
 		return converted
@@ -271,12 +291,14 @@ func validateTensor(t *testing.T, outData []float32, outShape shapes.Shape, inpu
 		}
 	}
 
-	relTolerance := 5.0
-	meanAbsTolerance := 10.0
+	maxRelTolerance := 5.0
+	meanTolerance := 0.1
 
-	if maxRelDiff > relTolerance || meanAbsDiff > meanAbsTolerance {
-		t.Errorf("[%s] Mismatch in values. Max rel diff: %.3g at idx %d (ex %f, got %f) -- tol %.3g. Mean abs diff: %.3g (%.3g is the mean absolute) -- tol %.3g",
-			name, maxRelDiff, maxRelDiffIdx, expected[maxRelDiffIdx], outData[maxRelDiffIdx], relTolerance, meanAbsDiff, meanAbsExpected, meanAbsTolerance)
+	if maxRelDiff > maxRelTolerance || meanAbsDiff >= meanTolerance*meanAbsExpected {
+		t.Errorf("[%s] Mismatch in values: Max rel diff: %.3g at idx %d (ex %f, got %f) / "+
+			"Mean abs diff: %.3g (== %.1f%% of the mean absolute values %.3g)",
+			name, maxRelDiff, maxRelDiffIdx, expected[maxRelDiffIdx], outData[maxRelDiffIdx],
+			meanAbsDiff, 100*meanAbsDiff/meanAbsExpected, meanAbsExpected)
 		for i, gotValue := range outData {
 			expectValue := float64(expected[i])
 			gotValueF64 := float64(gotValue)
@@ -286,7 +308,8 @@ func validateTensor(t *testing.T, outData []float32, outShape shapes.Shape, inpu
 			fmt.Printf("\t- Value #%d:\tgot %.3g,\t expected %.3g\n", i, gotValueF64, expectValue)
 		}
 	} else {
-		t.Logf("[%s] Match! Max rel diff: %.3g, Mean abs diff: %.3g (%.3g is the mean absolute)", name, maxRelDiff, meanAbsDiff, meanAbsExpected)
+		t.Logf("[%s] Match! Max rel diff: %.3g, Mean abs diff: %.3g (== %.1f%% of %.3g is the mean absolute)",
+			name, maxRelDiff, meanAbsDiff, 100*meanAbsDiff/meanAbsExpected, meanAbsExpected)
 	}
 }
 
@@ -324,7 +347,7 @@ func TestSentenceEmbedding(t *testing.T) {
 	}
 
 	exec, err := context.NewExec(testBackend, testCtx.Checked(false), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
-		x := testModel.SentenceEmbeddingGraph(ctx, tokens)
+		x := testModel.SentenceEmbeddingGraph(ctx, tokens, nil)
 		return graph.ConvertDType(x, dtypes.Float32)
 	})
 	if err != nil {
