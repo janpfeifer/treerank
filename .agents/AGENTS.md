@@ -1,2 +1,2 @@
-- Python's venv is located in /home/janpf/.venv/treerank. Activate that if you want to use python.
+- Python's virtual environment (venv) is located in /home/janpf/.venv/treerank. Activate that if you want to use python.
 - Any commands you need to execute, always suffix the command with a `&& exit`, so the agent software properly recognizes when the command finish.
