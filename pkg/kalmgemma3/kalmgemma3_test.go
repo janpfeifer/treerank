@@ -20,6 +20,8 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
+	"github.com/gomlx/gomlx/pkg/support/xslices"
+	"github.com/stretchr/testify/require"
 	"k8s.io/klog/v2"
 )
 
@@ -33,6 +35,7 @@ var (
 	testBackend backends.Backend
 	testCtx     *context.Context
 	testModel   *transformer.Model
+	taskPrompts TaskPrompts
 )
 
 func must(err error) {
@@ -58,8 +61,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	testCtx = context.New()
-
+	testCtx = context.New().Checked(false)
 	repo, err := LoadRepo()
 	if err != nil {
 		fmt.Printf("Failed to LoadRepo: %v\n", err)
@@ -76,17 +78,20 @@ func TestMain(m *testing.M) {
 		fmt.Printf("Prompts:\n")
 		for _, taskCode := range testModel.RegisteredPromptTasks() {
 			prompt := testModel.GetTaskPrompt(taskCode)
-			fmt.Printf("  [%s]:\n    %s\n\n", taskCode, prompt)
+			fmt.Printf("  [%s]:\n    %q\n\n", taskCode, prompt)
 		}
 		os.Exit(0)
 	}
 
-	fmt.Printf("%s\n\n", testModel.Description())
+	fmt.Printf("✅ Model: %s\n\n", testModel.Description())
+
+	taskPrompts = must1(LoadTaskPrompts(repo))
+	fmt.Printf("✅ Task prompts loaded: %d tasks\n", len(taskPrompts))
 
 	fmt.Printf("- Loading model weights ...")
 	start := time.Now()
 	must(testModel.LoadContext(testCtx))
-	fmt.Printf("done (%v)\n", time.Since(start))
+	fmt.Printf("\r✅ Loading model weights: done (%v)\n", time.Since(start))
 
 	fmt.Printf("- Upload variables to device ...")
 	start = time.Now()
@@ -104,7 +109,7 @@ func TestMain(m *testing.M) {
 	for range 3 {
 		runtime.GC()
 	}
-	fmt.Printf("done (%v)\n", time.Since(start))
+	fmt.Printf("\r✅ Upload variables to device: done (%v)\n", time.Since(start))
 
 	// Run the tests
 	code := m.Run()
@@ -167,7 +172,7 @@ func readPythonEmbeddings(path string, layersToRead []int) (map[int][]float32, e
 	return results, nil
 }
 
-func TestTransformerEmbeddings(t *testing.T) {
+func TestTransformerLayers(t *testing.T) {
 	// Ensure the weights were loaded.
 	varName := "embeddings"
 	if testCtx.In("token_embed").InspectVariableInScope(varName) == nil {
@@ -422,4 +427,37 @@ func validateFlatTensor(t *testing.T, gotData, expectedData []float32, name stri
 	} else {
 		t.Logf("[%s] Match! Max rel diff: %.3g, Mean abs diff: %.3g (%.3g is the mean absolute)", name, maxRelDiff, meanAbsDiff, meanAbsExpected)
 	}
+}
+
+func TestSimilarity(t *testing.T) {
+	queries := []string{
+		taskPrompts.BuildQueryPrompt("What is the capital of China?", ""),
+		taskPrompts.BuildQueryPrompt("Explain gravity", ""),
+	}
+	fmt.Printf("Queries: %q\n", queries)
+	docs := []string{
+		"The capital of China is Beijing.",
+		"Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+	}
+
+	prompts := make([]string, 0, len(queries)+len(docs))
+	prompts = append(prompts, queries...)
+	prompts = append(prompts, docs...)
+	allEmbeddings := make([]*tensors.Tensor, 0, len(prompts))
+	embedder := must1(testModel.SingleSentenceEmbeddingExec(testBackend, testCtx))
+	for _, prompt := range prompts {
+		tokens := must1(testModel.GetTokenizer()).Encode(prompt)
+		allEmbeddings = append(allEmbeddings, must1(embedder.Exec1(tokens)))
+	}
+
+	allEmbeddingsAny := xslices.Map(allEmbeddings, func(t *tensors.Tensor) any { return t })
+	similarities := must1(graph.ExecOnce(testBackend, func(allEmbeddings []*graph.Node) *graph.Node {
+		queryEmbeddings := graph.Concatenate(allEmbeddings[:len(queries)], 0)
+		docEmbeddings := graph.Concatenate(allEmbeddings[len(queries):], 0)
+		return testModel.Similarity(queryEmbeddings, docEmbeddings)
+	}, allEmbeddingsAny...))
+	fmt.Printf("Similarities: %v\n", similarities)
+	want := []float32{0.9316, 0.3984, 0.4251, 0.7317}
+	got := tensors.MustCopyFlatData[float32](similarities)
+	require.InDeltaSlicef(t, want, got, 1e-2, "Similaries don't match!")
 }

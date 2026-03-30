@@ -34,7 +34,7 @@ func main() {
 	// Loop over sentences:
 	for ii, sentence := range flag.Args() {
 		fmt.Printf("Sentence %d: %s\n", ii+1, sentence)
-		tokenIDs := tokenizer.EncodeWithOptions(sentence, true)
+		tokenIDs := tokenizer.Encode(sentence)
 		style := lipgloss.NewStyle().Underline(true)
 		tokens := xslices.Map(tokenIDs, func(tokenID int) string {
 			text := tokenizer.Decode([]int{tokenID})

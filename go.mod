@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/gomlx/go-huggingface v0.3.5-0.20260324083458-1d396e72f594
-	github.com/gomlx/gomlx v0.27.2
+	github.com/gomlx/gomlx v0.27.3-0.20260329065442-fff6979cb6b3
 	github.com/stretchr/testify v1.11.1
 	k8s.io/klog/v2 v2.140.0
 )
