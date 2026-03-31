@@ -49,13 +49,15 @@ def main():
     # SentenceTransformer handles the specific prefixes for models like KaLM automatically
     # if they are configured in the model's metadata.
     if args.query:
-        embeddings = model.encode(sentences, prompt_name="query") if hasattr(model, "prompts") and "query" in model.prompts else model.encode(sentences)
-        # Note: For KaLM specifically, SentenceTransformer usually maps encode_query 
-        # to the correct "Instruct: ...\nQuery:" prefix if the model is loaded correctly.
-        # If the model doesn't have named prompts, we'd manually prefix, 
-        # but modern ST models usually have this.
+        if hasattr(model, "encode_query"):
+            embeddings = model.encode_query(sentences)
+        else:
+            embeddings = model.encode(sentences, prompt_name="query") if hasattr(model, "prompts") and "query" in model.prompts else model.encode(sentences)
     else:
-        embeddings = model.encode(sentences)
+        if hasattr(model, "encode_document"):
+            embeddings = model.encode_document(sentences)
+        else:
+            embeddings = model.encode(sentences)
 
     for i, (orig, emb) in enumerate(zip(sentences, embeddings)):
         emb_list = emb.tolist()
