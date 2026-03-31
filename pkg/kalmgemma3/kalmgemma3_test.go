@@ -17,7 +17,6 @@ import (
 	_ "github.com/gomlx/gomlx/backends/default"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/graph"
-	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
 	"github.com/gomlx/gomlx/pkg/support/xslices"
@@ -36,6 +35,8 @@ var (
 	testCtx     *context.Context
 	testModel   *transformer.Model
 	taskPrompts TaskPrompts
+	testQueries []string
+	testDocs    []string
 )
 
 func must(err error) {
@@ -88,28 +89,22 @@ func TestMain(m *testing.M) {
 	taskPrompts = must1(LoadTaskPrompts(repo))
 	fmt.Printf("✅ Task prompts loaded: %d tasks\n", len(taskPrompts))
 
+	testQueries = []string{
+		taskPrompts.BuildQueryPrompt("What is the capital of China?", ""),
+		taskPrompts.BuildQueryPrompt("Explain gravity", ""),
+	}
+	testDocs = []string{
+		"The capital of China is Beijing.",
+		"Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
+	}
+
 	fmt.Printf("- Loading model weights ...")
 	start := time.Now()
-	must(testModel.LoadContext(testCtx))
-	fmt.Printf("\r✅ Loading model weights: done (%v)\n", time.Since(start))
-
-	fmt.Printf("- Upload variables to device ...")
-	start = time.Now()
-	for v := range testCtx.IterVariables() {
-		t, err := v.Value()
-		if err != nil {
-			klog.Fatalf("Failed to get variable %q value: %+v", v.Name(), err)
-		}
-		if err = t.MaterializeOnDevice(testBackend, false, 0); err != nil {
-			klog.Fatalf("Failed to materialize variable %q on device: %+v", v.Name(), err)
-		}
-		t.FinalizeLocal()
-		runtime.GC()
-	}
+	must(testModel.LoadContext(testBackend, testCtx))
 	for range 3 {
 		runtime.GC()
 	}
-	fmt.Printf("\r✅ Upload variables to device: done (%v)\n", time.Since(start))
+	fmt.Printf("\r✅ Loading model weights: done (%v)\n", time.Since(start))
 
 	// Run the tests
 	code := m.Run()
@@ -250,22 +245,25 @@ func TestTransformerLayers(t *testing.T) {
 		}
 		outTensor.ConstFlatData(func(flatAny any) {
 			flat := flatAny.([]float32)
-			validateTensor(t, flat, outTensor.Shape(), inputTokens, testModel.Config.HiddenSize, expectedData, name)
+			outShape := outTensor.Shape()
+			if outShape.Rank() < 3 {
+				t.Fatalf("[%s] Expected rank >= 3, got %s", name, outShape)
+			}
+			batchSize := outShape.Dimensions[1]
+			if batchSize != len(inputTokens) {
+				t.Fatalf("[%s] Expected %d tokens in output, got %d -- output shape is %s", name, len(inputTokens), batchSize, outShape)
+			}
+			if outShape.Dimensions[2] != testModel.Config.HiddenSize {
+				t.Fatalf("[%s] Expected hidden size %d, got %d -- output shape is %s", name, testModel.Config.HiddenSize, outShape.Dimensions[2], outShape)
+			}
+			validateTensor(t, flat, expectedData, name)
 		})
 	}
 }
 
-func validateTensor(t *testing.T, outData []float32, outShape shapes.Shape, inputTokens []int32, hiddenSize int, expected []float32, name string) {
-	batchSize := outShape.Dimensions[1]
-	if batchSize != len(inputTokens) {
-		t.Fatalf("[%s] Expected %d tokens in output, got %d -- output shape is %s", name, len(inputTokens), batchSize, outShape)
-	}
-	if outShape.Dimensions[2] != hiddenSize {
-		t.Fatalf("[%s] Expected hidden size %d, got %d -- output shape is %s", name, hiddenSize, outShape.Dimensions[2], outShape)
-	}
-
+func validateTensor(t *testing.T, outData []float32, expected []float32, name string) {
 	if len(outData) != len(expected) {
-		t.Fatalf("[%s] Shape mismatch: expected %d flat floats, got %d -- output shape is %s", name, len(expected), len(outData), outShape)
+		t.Fatalf("[%s] Shape mismatch: expected %d flat floats, got %d", name, len(expected), len(outData))
 	}
 
 	var sumAbsDiff, sumAbsExpected float64
@@ -342,11 +340,12 @@ func readPythonEmbeddingsList(path string) ([]float32, error) {
 }
 
 func TestSentenceEmbedding(t *testing.T) {
-	inputTokens := []int32{2, 9259, 4109}
-	inputTensor := tensors.FromValue([][]int32{inputTokens})
+	prompts := make([]string, 0, len(testQueries)+len(testDocs))
+	prompts = append(prompts, testQueries...)
+	prompts = append(prompts, testDocs...)
 
-	pythonPath := "hello_world_sentence_embed.txt"
-	expectedData, err := readPythonEmbeddingsList(pythonPath)
+	pythonPath := "similarity_embeddings.txt"
+	expectedFlatData, err := readPythonEmbeddingsList(pythonPath)
 	if err != nil {
 		t.Skipf("Skipping test because %s is not available: %v", pythonPath, err)
 	}
@@ -361,7 +360,8 @@ func TestSentenceEmbedding(t *testing.T) {
 
 	fmt.Printf("- Pre-compiling model ...")
 	start := time.Now()
-	_, err = exec.Exec(inputTensor)
+	dummyTokens := tensors.FromValue([][]int32{{2}})
+	_, err = exec.Exec(dummyTokens)
 	if err != nil {
 		t.Fatalf("Failed to compile graph: %v", err)
 	}
@@ -369,80 +369,44 @@ func TestSentenceEmbedding(t *testing.T) {
 
 	fmt.Printf("- Executing model ...")
 	start = time.Now()
-	results, err := exec.Exec(inputTensor)
-	if err != nil {
-		t.Fatalf("Failed to execute graph: %v", err)
+	hiddenSize := testModel.Config.HiddenSize
+	if len(expectedFlatData) != len(prompts)*hiddenSize {
+		t.Fatalf("Expected %d flat floats from python embeddings, got %d", len(prompts)*hiddenSize, len(expectedFlatData))
+	}
+
+	for i, prompt := range prompts {
+		tokensInt := must1(testModel.GetTokenizer()).Encode(prompt)
+		tokens := make([]int32, len(tokensInt))
+		for j, t := range tokensInt {
+			tokens[j] = int32(t)
+		}
+		inputTensor := tensors.FromValue([][]int32{tokens})
+		results, err := exec.Exec(inputTensor)
+		if err != nil {
+			t.Fatalf("Failed to execute graph for prompt %d: %v", i, err)
+		}
+
+		outTensor := results[0]
+		outShape := outTensor.Shape()
+		if outShape.Rank() != 2 || outShape.Dimensions[1] != hiddenSize {
+			t.Fatalf("Expected shape [batch, hidden_size] ([1, %d]), got %s", hiddenSize, outShape)
+		}
+
+		outTensor.ConstFlatData(func(flatAny any) {
+			flat := flatAny.([]float32)
+			expectedData := expectedFlatData[i*hiddenSize : (i+1)*hiddenSize]
+			validateTensor(t, flat, expectedData, fmt.Sprintf("Sentence Embedding %d", i))
+		})
 	}
 	fmt.Printf("done (%v)\n", time.Since(start))
-
-	outTensor := results[0]
-	outShape := outTensor.Shape()
-	if outShape.Rank() != 2 || outShape.Dimensions[1] != testModel.Config.HiddenSize {
-		t.Fatalf("Expected shape [batch, hidden_size] ([1, %d]), got %s", testModel.Config.HiddenSize, outShape)
-	}
-
-	outTensor.ConstFlatData(func(flatAny any) {
-		flat := flatAny.([]float32)
-		validateFlatTensor(t, flat, expectedData, "Sentence Embedding")
-	})
-}
-
-func validateFlatTensor(t *testing.T, gotData, expectedData []float32, name string) {
-	if len(gotData) != len(expectedData) {
-		t.Fatalf("[%s] Shape mismatch: expected %d flat floats, got %d", name, len(expectedData), len(gotData))
-	}
-
-	var sumAbsDiff, sumAbsExpected float64
-	var maxRelDiff float64
-	var maxRelDiffIdx int
-	for i, gotValue := range gotData {
-		expectValue := float64(expectedData[i])
-		gotValueF64 := float64(gotValue)
-		absDiff := math.Abs(gotValueF64 - expectValue)
-		sumAbsDiff += absDiff
-		sumAbsExpected += math.Abs(expectValue)
-	}
-	meanAbsDiff := sumAbsDiff / float64(len(gotData))
-	meanAbsExpected := sumAbsExpected / float64(len(gotData))
-
-	for i, gotValue := range gotData {
-		expectValue := float64(expectedData[i])
-		gotValueF64 := float64(gotValue)
-		absDiff := math.Abs(gotValueF64 - expectValue)
-		relDenominator := math.Max(math.Abs(expectValue), math.Abs(gotValueF64))
-		relDenominator = max(relDenominator, meanAbsExpected)
-		relDiff := absDiff / relDenominator
-		if relDiff > maxRelDiff {
-			maxRelDiff = relDiff
-			maxRelDiffIdx = i
-		}
-	}
-
-	relTolerance := 5.0
-	meanAbsTolerance := 10.0
-
-	if maxRelDiff > relTolerance || meanAbsDiff > meanAbsTolerance {
-		t.Errorf("[%s] Mismatch in values. Max rel diff: %.3g at idx %d (ex %f, got %f) -- tol %.3g. Mean abs diff: %.3g (%.3g is the mean absolute) -- tol %.3g",
-			name, maxRelDiff, maxRelDiffIdx, expectedData[maxRelDiffIdx], gotData[maxRelDiffIdx], relTolerance, meanAbsDiff, meanAbsExpected, meanAbsTolerance)
-	} else {
-		t.Logf("[%s] Match! Max rel diff: %.3g, Mean abs diff: %.3g (%.3g is the mean absolute)", name, maxRelDiff, meanAbsDiff, meanAbsExpected)
-	}
 }
 
 func TestSimilarity(t *testing.T) {
-	queries := []string{
-		taskPrompts.BuildQueryPrompt("What is the capital of China?", ""),
-		taskPrompts.BuildQueryPrompt("Explain gravity", ""),
-	}
-	fmt.Printf("Queries: %q\n", queries)
-	docs := []string{
-		"The capital of China is Beijing.",
-		"Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.",
-	}
+	fmt.Printf("Queries: %q\n", testQueries)
 
-	prompts := make([]string, 0, len(queries)+len(docs))
-	prompts = append(prompts, queries...)
-	prompts = append(prompts, docs...)
+	prompts := make([]string, 0, len(testQueries)+len(testDocs))
+	prompts = append(prompts, testQueries...)
+	prompts = append(prompts, testDocs...)
 	allEmbeddings := make([]*tensors.Tensor, 0, len(prompts))
 	embedder := must1(testModel.SingleSentenceEmbeddingExec(testBackend, testCtx))
 	for _, prompt := range prompts {
@@ -452,8 +416,8 @@ func TestSimilarity(t *testing.T) {
 
 	allEmbeddingsAny := xslices.Map(allEmbeddings, func(t *tensors.Tensor) any { return t })
 	similarities := must1(graph.ExecOnce(testBackend, func(allEmbeddings []*graph.Node) *graph.Node {
-		queryEmbeddings := graph.Concatenate(allEmbeddings[:len(queries)], 0)
-		docEmbeddings := graph.Concatenate(allEmbeddings[len(queries):], 0)
+		queryEmbeddings := graph.Concatenate(allEmbeddings[:len(testQueries)], 0)
+		docEmbeddings := graph.Concatenate(allEmbeddings[len(testQueries):], 0)
 		return testModel.Similarity(queryEmbeddings, docEmbeddings)
 	}, allEmbeddingsAny...))
 	fmt.Printf("Similarities: %v\n", similarities)
