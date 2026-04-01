@@ -174,11 +174,6 @@ func TestTransformerLayers(t *testing.T) {
 		t.Fatalf("Variable token_embed/%s not loaded in context", varName)
 	}
 
-	// We use the tokens from "Hello World" which are usually known, but let's hardcode the ones we saw in Python.
-	// In the python output it was: [2, 9259, 4109]
-	inputTokens := []int32{2, 9259, 4109}
-	inputTensor := tensors.FromValue([][]int32{inputTokens})
-
 	layersToCheck := []int{0, 1, 2, 10, 20, 30, 40, testModel.Config.NumHiddenLayers}
 
 	uniqueLayers := make(map[int]bool)
@@ -187,20 +182,6 @@ func TestTransformerLayers(t *testing.T) {
 		if l <= testModel.Config.NumHiddenLayers && !uniqueLayers[l] {
 			uniqueLayers[l] = true
 			finalLayersToCheck = append(finalLayersToCheck, l)
-		}
-	}
-
-	// Require Python embeddings to exist
-	pythonPath := "hello_world_embeddings.txt"
-	expectedLayers, err := readPythonEmbeddings(pythonPath, finalLayersToCheck)
-	if err != nil {
-		t.Skipf("Skipping test because %s is not available: %v", pythonPath, err)
-	}
-
-	// Ensure that we successfully parsed the required layers.
-	for _, l := range finalLayersToCheck {
-		if len(expectedLayers[l]) == 0 {
-			t.Fatalf("Failed to read expected data for layer %d from %s", l, pythonPath)
 		}
 	}
 
@@ -216,59 +197,84 @@ func TestTransformerLayers(t *testing.T) {
 		t.Fatalf("Failed to create exec: %v", err)
 	}
 
-	fmt.Printf("- Pre-compiling model ...")
-	start := time.Now()
-	_, err = exec.Exec(inputTensor)
-	if err != nil {
-		t.Fatalf("Failed to compile graph: %v", err)
-	}
-	fmt.Printf("done (%v)\n", time.Since(start))
-
-	fmt.Printf("- Executing model ...")
-	start = time.Now()
-	results, err := exec.Exec(inputTensor)
-	if err != nil {
-		t.Fatalf("Failed to execute graph: %v", err)
-	}
-	fmt.Printf("done (%v)\n", time.Since(start))
-
-	if len(results) < testModel.Config.NumHiddenLayers+1 {
-		t.Fatalf("Expected at least %d outputs from graph, got %d", testModel.Config.NumHiddenLayers+1, len(results))
+	cases := []struct {
+		name     string
+		prompt   string
+		fileName string
+	}{
+		{"Query 1", testQueries[0], "layer_emb_q1.txt"},
+		{"Query 2", testQueries[1], "layer_emb_q2.txt"},
+		{"Doc 1", testDocs[0], "layer_emb_d1.txt"},
+		{"Doc 2", testDocs[1], "layer_emb_d2.txt"},
 	}
 
-	for _, l := range finalLayersToCheck {
-		outTensor := results[l]
-		expectedData := expectedLayers[l]
-		name := fmt.Sprintf("Layer %d Output", l)
-		if l == 0 {
-			name = "Token Embeddings"
-		}
-		outTensor.ConstFlatData(func(flatAny any) {
-			flat := flatAny.([]float32)
-			outShape := outTensor.Shape()
-			if outShape.Rank() < 3 {
-				t.Fatalf("[%s] Expected rank >= 3, got %s", name, outShape)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedLayers, err := readPythonEmbeddings(tc.fileName, finalLayersToCheck)
+			if err != nil {
+				t.Skipf("Skipping test because %s is not available: %v", tc.fileName, err)
 			}
-			batchSize := outShape.Dimensions[1]
-			if batchSize != len(inputTokens) {
-				t.Fatalf("[%s] Expected %d tokens in output, got %d -- output shape is %s", name, len(inputTokens), batchSize, outShape)
+			for _, l := range finalLayersToCheck {
+				if len(expectedLayers[l]) == 0 {
+					t.Fatalf("Failed to read expected data for layer %d from %s", l, tc.fileName)
+				}
 			}
-			if outShape.Dimensions[2] != testModel.Config.HiddenSize {
-				t.Fatalf("[%s] Expected hidden size %d, got %d -- output shape is %s", name, testModel.Config.HiddenSize, outShape.Dimensions[2], outShape)
+
+			tokensInt := must1(testModel.GetTokenizer()).Encode(tc.prompt)
+			tokens := make([]int32, len(tokensInt))
+			for j, tIdx := range tokensInt {
+				tokens[j] = int32(tIdx)
 			}
-			validateTensor(t, flat, expectedData, name)
+			inputTensor := tensors.FromValue([][]int32{tokens})
+
+			fmt.Printf("- Executing model for %s ...", tc.name)
+			start := time.Now()
+			results, err := exec.Exec(inputTensor)
+			if err != nil {
+				t.Fatalf("Failed to execute graph: %v", err)
+			}
+			fmt.Printf("done (%v)\n", time.Since(start))
+
+			if len(results) < testModel.Config.NumHiddenLayers+1 {
+				t.Fatalf("Expected at least %d outputs from graph, got %d", testModel.Config.NumHiddenLayers+1, len(results))
+			}
+
+			for _, l := range finalLayersToCheck {
+				outTensor := results[l]
+				expectedData := expectedLayers[l]
+				name := fmt.Sprintf("Layer %d Output", l)
+				if l == 0 {
+					name = "Token Embeddings"
+				}
+				outTensor.ConstFlatData(func(flatAny any) {
+					flat := flatAny.([]float32)
+					outShape := outTensor.Shape()
+					if outShape.Rank() < 3 {
+						t.Fatalf("[%s] Expected rank >= 3, got %s", name, outShape)
+					}
+					batchSize := outShape.Dimensions[1]
+					if batchSize != len(tokens) {
+						t.Fatalf("[%s] Expected %d tokens in output, got %d -- output shape is %s", name, len(tokens), batchSize, outShape)
+					}
+					if outShape.Dimensions[2] != testModel.Config.HiddenSize {
+						t.Fatalf("[%s] Expected hidden size %d, got %d -- output shape is %s", name, testModel.Config.HiddenSize, outShape.Dimensions[2], outShape)
+					}
+					validateTensor(t, flat, expectedData, name)
+				})
+			}
 		})
 	}
 }
 
-func validateTensor(t *testing.T, outData []float32, expected []float32, name string) {
-	if len(outData) != len(expected) {
-		t.Fatalf("[%s] Shape mismatch: expected %d flat floats, got %d", name, len(expected), len(outData))
+func validateTensor(t *testing.T, got []float32, expected []float32, name string) {
+	if len(got) != len(expected) {
+		t.Fatalf("[%s] Shape mismatch: expected %d flat floats (%d tokens), got %d (%d tokens)",
+			name, len(expected), len(expected)/EmbeddingDim, len(got), len(got)/EmbeddingDim)
 	}
 
 	var sumAbsDiff, sumAbsExpected float64
 	const minRelDenominator = 0.2
-	for i, gotValue := range outData {
+	for i, gotValue := range got {
 		expectValue := float64(expected[i])
 		gotValueF64 := float64(gotValue)
 
@@ -276,12 +282,12 @@ func validateTensor(t *testing.T, outData []float32, expected []float32, name st
 		sumAbsDiff += absDiff
 		sumAbsExpected += math.Abs(expectValue)
 	}
-	meanAbsDiff := sumAbsDiff / float64(len(outData))
-	meanAbsExpected := sumAbsExpected / float64(len(outData))
+	meanAbsDiff := sumAbsDiff / float64(len(got))
+	meanAbsExpected := sumAbsExpected / float64(len(got))
 
 	var maxRelDiff float64
 	var maxRelDiffIdx int
-	for i, gotValue := range outData {
+	for i, gotValue := range got {
 		expectValue := float64(expected[i])
 		gotValueF64 := float64(gotValue)
 		absDiff := math.Abs(gotValueF64 - expectValue)
@@ -300,12 +306,12 @@ func validateTensor(t *testing.T, outData []float32, expected []float32, name st
 	if maxRelDiff > maxRelTolerance || meanAbsDiff >= meanTolerance*meanAbsExpected {
 		t.Errorf("[%s] Mismatch in values: Max rel diff: %.3g at idx %d (ex %f, got %f) / "+
 			"Mean abs diff: %.3g (== %.1f%% of the mean absolute values %.3g)",
-			name, maxRelDiff, maxRelDiffIdx, expected[maxRelDiffIdx], outData[maxRelDiffIdx],
+			name, maxRelDiff, maxRelDiffIdx, expected[maxRelDiffIdx], got[maxRelDiffIdx],
 			meanAbsDiff, 100*meanAbsDiff/meanAbsExpected, meanAbsExpected)
-		for i, gotValue := range outData {
+		for i, gotValue := range got {
 			expectValue := float64(expected[i])
 			gotValueF64 := float64(gotValue)
-			if i > 10 && i < len(outData)-10 {
+			if i > 10 && i < len(got)-10 {
 				continue
 			}
 			fmt.Printf("\t- Value #%d:\tgot %.3g,\t expected %.3g\n", i, gotValueF64, expectValue)

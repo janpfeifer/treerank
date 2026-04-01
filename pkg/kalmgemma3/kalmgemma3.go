@@ -25,6 +25,9 @@ const (
 	// Remember to set Model.WithCausalMask(false) when using this model.
 	// (The default is set to use causal mask, but the model shouldn't use it)
 	Repository = "tencent/KaLM-Embedding-Gemma3-12B-2511"
+
+	// Embedding dimension, per token, or pooled for sentence.
+	EmbeddingDim = 3840
 )
 
 // LoadRepo creates a hub.Repo that can be used to download tokenizer, configuration files and model files.
