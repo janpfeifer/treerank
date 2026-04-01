@@ -50,3 +50,5 @@ require (
 )
 
 tool github.com/gomlx/go-huggingface/cmd/generate_dataset_structs
+
+replace github.com/gomlx/go-huggingface => ../go-huggingface

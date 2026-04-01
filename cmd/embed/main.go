@@ -20,12 +20,12 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gomlx/go-huggingface/datasets"
+	"github.com/gomlx/go-huggingface/examples/kalmgemma3"
+	"github.com/gomlx/go-huggingface/examples/msmarco"
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/models/transformer"
 	"github.com/gomlx/go-huggingface/tokenizers"
 	"github.com/gomlx/gomlx/pkg/support/xslices"
-	"github.com/janpfeifer/treerank/pkg/kalmgemma3"
-	"github.com/janpfeifer/treerank/pkg/msmarco"
 	"k8s.io/klog/v2"
 )
 

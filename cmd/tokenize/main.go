@@ -6,10 +6,10 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/gomlx/go-huggingface/examples/kalmgemma3"
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/tokenizers"
 	"github.com/gomlx/gomlx/pkg/support/xslices"
-	"github.com/janpfeifer/treerank/pkg/kalmgemma3"
 	"k8s.io/klog/v2"
 )
 
