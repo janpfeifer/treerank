@@ -338,6 +338,8 @@ func main() {
 	wg.Wait()
 	elapsed := time.Since(startTime)
 	fmt.Printf("Total duration: %v\n", humanize.Duration(elapsed))
+
+	// Print nice report table with counts and speeds.
 	names := []string{"Queries", "Passages", "Tokens", "Non-Pad Tokens"}
 	totals := []string{humanize.Count(int64(numQueriesRead)), humanize.Count(int64(numPassagesRead)), humanize.Count(numTokensProcessed), humanize.Count(numNonPadTokensProcessed)}
 	speeds := []string{
@@ -347,7 +349,6 @@ func main() {
 		humanize.Speed(float64(numNonPadTokensProcessed)/elapsed.Seconds(), "tokens"),
 	}
 	baseStyle := lipgloss.NewStyle().Padding(0, 1)
-
 	t := table.New().
 		Border(lipgloss.NormalBorder()).
 		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("238"))).
@@ -366,7 +367,6 @@ func main() {
 			}
 			return s
 		})
-
 	for i := range names {
 		t.Row(names[i], totals[i], speeds[i])
 	}
