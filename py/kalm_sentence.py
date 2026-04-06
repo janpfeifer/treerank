@@ -1,6 +1,7 @@
 import argparse
 import sys
 import os
+import time
 
 def main():
     parser = argparse.ArgumentParser(description="Generate embeddings for sentences using local HuggingFace transformers.")
@@ -38,8 +39,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     
     print(f"Loading model: {args.model}...", file=sys.stderr)
+    start_time = time.time()
     # We use torch_dtype="auto" and device_map="auto" to handle the 12B model gracefully if possible.
     model = AutoModel.from_pretrained(args.model, trust_remote_code=True, torch_dtype="auto", device_map="auto")
+    print(f"Model loaded in {time.time() - start_time:.2f} seconds.", file=sys.stderr)
     
     sentences = args.sentences
     if not sentences:

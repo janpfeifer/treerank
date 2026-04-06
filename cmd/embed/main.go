@@ -4,10 +4,14 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"math/bits"
 	"os"
 	"path/filepath"
-	"runtime"
+	"sync"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/lipgloss/table"
 
 	"github.com/gomlx/go-huggingface/datasets"
 	"github.com/gomlx/go-huggingface/examples/kalmgemma3"
@@ -20,9 +24,10 @@ import (
 	_ "github.com/gomlx/gomlx/backends/default"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/graph"
+	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
-	"github.com/gomlx/gomlx/pkg/support/xslices"
+	"github.com/janpfeifer/treerank/internal/humanize"
 	"k8s.io/klog/v2"
 )
 
@@ -36,6 +41,11 @@ var (
 type Work struct {
 	IsQuery bool
 	ID      int32
+}
+
+func MapHas[K comparable, V any](m map[K]V, k K) bool {
+	_, ok := m[k]
+	return ok
 }
 
 func main() {
@@ -67,21 +77,6 @@ func main() {
 		return nil, model.LoadContext(backend, ctx)
 	})
 
-	mustRunWithElapsedTime("Uploading variables to device", func() (any, error) {
-		for v := range ctx.IterVariables() {
-			t, err := v.Value()
-			if err != nil {
-				return nil, err
-			}
-			if err = t.MaterializeOnDevice(backend, false, 0); err != nil {
-				return nil, err
-			}
-			t.FinalizeLocal()
-			runtime.GC()
-		}
-		return nil, nil
-	})
-
 	padID := 0
 	if id, err := tokenizer.SpecialTokenID(tapi.TokPad); err == nil {
 		padID = id
@@ -89,13 +84,15 @@ func main() {
 
 	embedExec := mustRunWithElapsedTime("Compiling execution graph", func() (*context.Exec, error) {
 		exec, err := context.NewExec(backend, ctx.Checked(false), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
-			mask := graph.NotEqual(tokens, graph.Const(tokens.Graph(), int32(padID)))
+			constPadID := graph.Scalar(tokens.Graph(), tokens.DType(), padID)
+			mask := graph.NotEqual(tokens, constPadID)
 			x := model.SentenceEmbeddingGraph(ctx, tokens, mask)
 			return graph.ConvertDType(x, dtypes.Float32)
 		})
 		return exec, err
 	})
 
+	// Prepare output files in split sub-directory.
 	splitDir := filepath.Join(*flagData, *flagMSMarcoSplit)
 	if err := os.MkdirAll(splitDir, 0755); err != nil {
 		klog.Fatalf("Failed to create split directory: %v", err)
@@ -117,77 +114,88 @@ func main() {
 	defer fQueryIndices.Close()
 	fQueryIsSelected := openBin("query_is_selected.bin")
 	defer fQueryIsSelected.Close()
-
 	passageToID := make(map[string]int32, 1000)
 
-	inputChan := make(chan bucket.SentenceRef)
-	outputChan := make(chan bucket.Bucket, 10)
+	// Structured concurrency (keep track of goroutines).
+	var wg sync.WaitGroup
 
+	// Start bucket runner in a separate goroutine.
+	bucketsInputChan := make(chan bucket.SentenceRef)
+	bucketsOutputChan := make(chan bucket.Bucket, 10)
 	bkt := bucket.New(tokenizer).
 		ByPower(32, 8, 2).
 		WithMaxDelay(100*time.Millisecond, true).
 		WithMaxParallelization(-1)
+	wg.Go(func() {
+		bkt.Run(bucketsInputChan, bucketsOutputChan)
+	})
 
-	go bkt.Run(inputChan, outputChan)
+	// Dataset preparation and stats.
+	ds := datasets.New(msmarco.ID)
+	limit := *flagLimit
+	var numQueriesRead int32
+	var numPassagesRead int32
+	dsInfo, err := ds.Info()
+	if err != nil {
+		klog.Fatalf("Failed to get dataset info: %v", err)
+	}
+	if !MapHas(dsInfo.DatasetInfo, msmarco.Config) || !MapHas(dsInfo.DatasetInfo[msmarco.Config].Splits, *flagMSMarcoSplit) {
+		klog.Fatalf("Dataset %q doesn't contents for config=%q / split=%q", ds.ID, msmarco.Config, *flagMSMarcoSplit)
+	}
+	splitInfo := dsInfo.DatasetInfo[msmarco.Config].Splits[*flagMSMarcoSplit]
+	totalQueries := splitInfo.NumExamples
+	fmt.Printf("- Dataset %q, split %q: %d queries in total\n", ds.ID, *flagMSMarcoSplit, totalQueries)
+	if limit > 0 {
+		limit = min(limit, int(totalQueries))
+	}
 
-	var numQueries int32
-	var numPassages int32
-	producerDone := make(chan struct{})
-
-	go func() {
-		defer close(producerDone)
-		defer close(inputChan)
-		ds := datasets.New(msmarco.ID)
-
+	// Start goroutine that feeds the bucket runner with queries and passages.
+	// It also sequentially saves the fQueryIndices and fQueryIsSelected files.
+	wg.Go(func() {
+		defer close(bucketsInputChan)
 		count := 0
-		limit := *flagLimit
-
 		for record, err := range datasets.IterParquetFromDataset[msmarco.MsMarcoRecord](ds, msmarco.Config, *flagMSMarcoSplit) {
 			if err != nil {
 				klog.Fatalf("Dataset iterator error: %v", err)
 			}
 
-			qID := numQueries
-			numQueries++
+			queryID := numQueriesRead
+			numQueriesRead++
 
-			inputChan <- bucket.SentenceRef{
+			bucketsInputChan <- bucket.SentenceRef{
 				Sentence:  record.Query,
-				Reference: Work{IsQuery: true, ID: qID},
+				Reference: Work{IsQuery: true, ID: queryID},
 			}
 
 			var indices [10]int32
+			var isSelected [10]byte
 			for i := range indices {
 				indices[i] = -1
 			}
-			var isSelected [10]byte
-			for i := range isSelected {
-				isSelected[i] = 0
-			}
 
-			pLens := len(record.Passages.PassageText)
-			if pLens > 10 {
-				pLens = 10
-			}
-
-			for i := 0; i < pLens; i++ {
-				text := record.Passages.PassageText[i]
+			// There should be at most 10 passages per query in the datasets, but
+			// just in case we enforce the limit.
+			pLens := min(len(record.Passages.PassageText), 10)
+			for queryPassageIdx := range pLens {
+				text := record.Passages.PassageText[queryPassageIdx]
 				if text == "" {
 					continue
 				}
 
-				pID, exists := passageToID[text]
+				// Registers new passage if it doesn't exist yet.
+				passageID, exists := passageToID[text]
 				if !exists {
-					pID = numPassages
-					numPassages++
-					passageToID[text] = pID
-					inputChan <- bucket.SentenceRef{
+					passageID = numPassagesRead
+					numPassagesRead++
+					passageToID[text] = passageID
+					bucketsInputChan <- bucket.SentenceRef{
 						Sentence:  text,
-						Reference: Work{IsQuery: false, ID: pID},
+						Reference: Work{IsQuery: false, ID: passageID},
 					}
 				}
-				indices[i] = pID
-				if i < len(record.Passages.IsSelected) && record.Passages.IsSelected[i] > 0 {
-					isSelected[i] = 1
+				indices[queryPassageIdx] = passageID
+				if queryPassageIdx < len(record.Passages.IsSelected) && record.Passages.IsSelected[queryPassageIdx] > 0 {
+					isSelected[queryPassageIdx] = 1
 				}
 			}
 
@@ -203,100 +211,166 @@ func main() {
 				break
 			}
 		}
-	}()
+	})
 
-	fmt.Println("Starting processing...")
-
+	// Process batches and save embeddings.
 	const embeddingDim = 3840
 	const bytePerFloat = 4
 	embeddingByteLen := embeddingDim * bytePerFloat
 
 	startTime := time.Now()
-	var totalRecordsProcessed int32
+	var numTokensProcessed, numNonPadTokensProcessed int64
+	var numSentencesProcessed, numQueriesProcessed int
+	expectedNumQueries := limit
+	if expectedNumQueries <= 0 {
+		expectedNumQueries = int(totalQueries)
+	}
 	var emaSpeed float64
 	var emaInitialized bool
 
-	for bk := range outputChan {
-		if bk.Error != nil {
-			klog.Fatalf("Tokenization error: %v", bk.Error)
-		}
+	wg.Go(func() {
 
-		batchSize := bk.Shape.BatchSize
-		seqLen := bk.Shape.SentenceLength
+		fmt.Printf("- Starting processing:\n")
+		lastReportTime := time.Now()
+		var queriesPerSecond float64
+		for bk := range bucketsOutputChan {
+			if bk.Error != nil {
+				klog.Fatalf("Tokenization error: %v", bk.Error)
+			}
 
-		flatData := xslices.Map(bk.Batch, func(i int) int32 { return int32(i) })
-		inputTensor := tensors.FromFlatDataAndDimensions(flatData, batchSize, seqLen)
+			batchSize := bk.Shape.BatchSize
+			seqLen := bk.Shape.SentenceLength
 
-		batchStartTime := time.Now()
-		results, err := embedExec.Exec(inputTensor)
-		if err != nil {
-			klog.Fatalf("Failed to execute embeddings: %v", err)
-		}
+			rawData := dtypes.UnsafeByteSlice(bk.Batch)
+			var dtype dtypes.DType
+			switch bits.UintSize {
+			case 32:
+				dtype = dtypes.Int32
+			case 64:
+				dtype = dtypes.Int64
+			default:
+				klog.Fatalf("Unsupported int of %d-bits architecture", bits.UintSize)
+			}
+			inputTensor, err := tensors.FromRaw(backend, 0, shapes.Make(dtype, batchSize, seqLen), rawData)
+			if err != nil {
+				klog.Fatalf("Failed to create input tensor: %+v", err)
+			}
 
-		outTensor := results[0]
-		outTensor.ConstFlatData(func(flatAny any) {
-			flatFloat32 := flatAny.([]float32)
+			batchStartTime := time.Now()
+			outTensor, err := embedExec.Exec1(inputTensor)
+			if err != nil {
+				klog.Fatalf("Failed to execute embeddings: %v", err)
+			}
+			numTokensProcessed += int64(len(bk.Batch))
+			numNonPadTokensProcessed += int64(bk.NonPadTokens)
+			outTensor.ConstFlatData(func(flatAny any) {
+				flatFloat32 := flatAny.([]float32)
+				for i := range batchSize {
+					if bk.References[i] == nil {
+						continue
+					}
+					ref, ok := bk.References[i].(Work)
+					if !ok {
+						continue
+					}
 
-			for i := 0; i < batchSize; i++ {
-				if bk.References[i] == nil {
-					continue
+					startIdx := i * embeddingDim
+					embedRow := flatFloat32[startIdx : startIdx+embeddingDim]
+
+					offset := int64(ref.ID) * int64(embeddingByteLen)
+					var file *os.File
+					if ref.IsQuery {
+						file = fQueries
+					} else {
+						file = fPassages
+					}
+
+					err := binary.Write(ioWriterAt{file, offset}, binary.LittleEndian, embedRow)
+					if err != nil {
+						klog.Fatalf("Failed writing embedding: %v", err)
+					}
 				}
-				ref, ok := bk.References[i].(Work)
-				if !ok {
-					continue
-				}
+			})
+			inputTensor.FinalizeAll()
+			outTensor.FinalizeAll()
 
-				startIdx := i * embeddingDim
-				embedRow := flatFloat32[startIdx : startIdx+embeddingDim]
-
-				offset := int64(ref.ID) * int64(embeddingByteLen)
-				var file *os.File
-				if ref.IsQuery {
-					file = fQueries
+			// Moving average of (non-padding) tokens per second speed.
+			batchDuration := time.Since(batchStartTime).Seconds()
+			if batchDuration > 0 {
+				currentSpeed := float64(bk.NonPadTokens) / batchDuration
+				if !emaInitialized {
+					emaSpeed = currentSpeed
+					emaInitialized = true
 				} else {
-					file = fPassages
-				}
-
-				err := binary.Write(ioWriterAt{file, offset}, binary.LittleEndian, embedRow)
-				if err != nil {
-					klog.Fatalf("Failed writing embedding: %v", err)
+					emaSpeed = 0.1*currentSpeed + 0.9*emaSpeed
 				}
 			}
+
+			// Count queries and sentences processed.
+			numSentencesProcessed += batchSize
+			for i := range batchSize {
+				if bk.References[i] != nil && bk.References[i].(Work).IsQuery {
+					numQueriesProcessed++
+				}
+			}
+
+			// Report progress every second.
+			if time.Since(lastReportTime) > time.Second {
+				lastReportTime = time.Now()
+
+				// ETA estimation.
+				queriesPerSecond = float64(numQueriesProcessed) / time.Since(startTime).Seconds()
+				eta := "Unknown"
+				if numQueriesProcessed > 0 {
+					remainingSeconds := float64(expectedNumQueries-numQueriesProcessed) / queriesPerSecond
+					eta = humanize.Duration(time.Duration(int64(remainingSeconds*1e9)) * time.Nanosecond)
+				}
+				fmt.Printf("\r  - Processed %s / %s queries (%s, %s non-padding) -- ETA %s ...%s",
+					humanize.Count(int64(numQueriesProcessed)), humanize.Count(int64(expectedNumQueries)), humanize.Speed(queriesPerSecond, "queries"),
+					humanize.Speed(emaSpeed, "tokens"), eta, humanize.EraseToEndOfLine)
+			}
+		}
+		fmt.Printf("\r  - Processed %s / %s queries (%s, %s non-padding) -- done.%s\n",
+			humanize.Count(int64(numQueriesProcessed)), humanize.Count(int64(expectedNumQueries)), humanize.Speed(queriesPerSecond, "queries"),
+			humanize.Speed(emaSpeed, "tokens"), humanize.EraseToEndOfLine)
+	})
+
+	wg.Wait()
+	elapsed := time.Since(startTime)
+	fmt.Printf("Total duration: %v\n", humanize.Duration(elapsed))
+	names := []string{"Queries", "Passages", "Tokens", "Non-Pad Tokens"}
+	totals := []string{humanize.Count(int64(numQueriesRead)), humanize.Count(int64(numPassagesRead)), humanize.Count(numTokensProcessed), humanize.Count(numNonPadTokensProcessed)}
+	speeds := []string{
+		humanize.Speed(float64(numQueriesRead)/elapsed.Seconds(), " items"),
+		humanize.Speed(float64(numPassagesRead)/elapsed.Seconds(), " items"),
+		humanize.Speed(float64(numTokensProcessed)/elapsed.Seconds(), "tokens"),
+		humanize.Speed(float64(numNonPadTokensProcessed)/elapsed.Seconds(), "tokens"),
+	}
+	baseStyle := lipgloss.NewStyle().Padding(0, 1)
+
+	t := table.New().
+		Border(lipgloss.NormalBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("238"))).
+		Headers("Metric", "Total", "Speed").
+		StyleFunc(func(row, col int) lipgloss.Style {
+			s := baseStyle
+			if col > 0 && row != table.HeaderRow {
+				s = s.Align(lipgloss.Right)
+			}
+			if row == table.HeaderRow {
+				headerStyle := s.Foreground(lipgloss.Color("252")).Bold(true)
+				if col > 0 {
+					headerStyle = headerStyle.Align(lipgloss.Center)
+				}
+				return headerStyle
+			}
+			return s
 		})
 
-		inputTensor.FinalizeAll()
-		results[0].FinalizeAll()
-
-		totalRecordsProcessed += int32(batchSize)
-		
-		batchDuration := time.Since(batchStartTime).Seconds()
-		if batchDuration > 0 {
-			currentSpeed := float64(batchSize) / batchDuration
-			if !emaInitialized {
-				emaSpeed = currentSpeed
-				emaInitialized = true
-			} else {
-				emaSpeed = 0.1*currentSpeed + 0.9*emaSpeed
-			}
-		}
-
-		if totalRecordsProcessed%100 == 0 || totalRecordsProcessed < 10 {
-			expectedTotal := float64(numQueries + numPassages)
-			var expectedRemaining string = "Unknown"
-			if expectedTotal > float64(totalRecordsProcessed) && emaSpeed > 0 {
-				remains := int((expectedTotal - float64(totalRecordsProcessed)) / emaSpeed)
-				expectedRemaining = (time.Duration(remains) * time.Second).String()
-			}
-			fmt.Printf("Processed %d embed requests... [%.2f it/s] Expected remaining time (approx): %s\n", 
-				totalRecordsProcessed, emaSpeed, expectedRemaining)
-		}
+	for i := range names {
+		t.Row(names[i], totals[i], speeds[i])
 	}
-
-	<-producerDone
-
-	fmt.Printf("\nDone.\nTotal duration: %v\n", time.Since(startTime))
-	fmt.Printf("Total Queries: %d\n", numQueries)
-	fmt.Printf("Total Unique Passages: %d\n", numPassages)
+	fmt.Println(t)
 }
 
 func mustRunWithElapsedTime[T any](name string, f func() (T, error)) T {
