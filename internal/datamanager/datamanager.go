@@ -1,4 +1,4 @@
-package dataparser
+package datamanager
 
 import (
 	"fmt"
@@ -105,7 +105,7 @@ func (d *DataManager) LoadQueryIndices(backend backends.Backend) (*tensors.Tenso
 
 // LoadQueryIsSelected loads the is_selected flags for each passage of a query.
 func (d *DataManager) LoadQueryIsSelected(backend backends.Backend) (*tensors.Tensor, error) {
-	shape := shapes.Make(dtypes.Bool, d.NumQueries, PassagesPerQuery)
+	shape := shapes.Make(dtypes.Int8, d.NumQueries, PassagesPerQuery)
 	return tensors.FromRaw(backend, 0, shape, []byte(d.QueryIsSelectedMMap))
 }
 
@@ -137,6 +137,12 @@ func (d *DataManager) LoadPassage(backend backends.Backend, passageID int) (*ten
 func (d *DataManager) LoadQueries(backend backends.Backend) (*tensors.Tensor, error) {
 	shape := shapes.Make(dtypes.Float32, d.NumQueries, EmbeddingSize)
 	return tensors.FromRaw(backend, 0, shape, []byte(d.QueriesMMap))
+}
+
+// LoadPassages loads all the passages into one large tensor shaped [NumPassages, EmbeddingSize].
+func (d *DataManager) LoadPassages(backend backends.Backend) (*tensors.Tensor, error) {
+	shape := shapes.Make(dtypes.Float32, d.NumPassages, EmbeddingSize)
+	return tensors.FromRaw(backend, 0, shape, []byte(d.PassagesMMap))
 }
 
 // LoadPassagesBatch loads a batch of passages int a tensor shaped [batchSize, EmbeddingSize].

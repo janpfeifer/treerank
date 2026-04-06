@@ -49,6 +49,7 @@ func MapHas[K comparable, V any](m map[K]V, k K) bool {
 }
 
 func main() {
+	klog.InitFlags(nil)
 	flag.Parse()
 
 	if *flagData == "" {
