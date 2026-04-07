@@ -4,8 +4,10 @@ go 1.25.0
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/edsrzf/mmap-go v1.2.0
+	github.com/gomlx/exceptions v0.0.3
 	github.com/gomlx/go-huggingface v0.3.5-0.20260406073524-ceead76f438a
-	github.com/gomlx/gomlx v0.27.3-0.20260404100428-4094c2b5f72d
+	github.com/gomlx/gomlx v0.27.3-0.20260407140637-36aec8245f10
 	k8s.io/klog/v2 v2.140.0
 )
 
@@ -19,7 +21,6 @@ require (
 	github.com/clipperhouse/displaywidth v0.11.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/edsrzf/mmap-go v1.2.0 // indirect
 	github.com/eliben/go-sentencepiece v0.7.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/gofrs/flock v0.13.0 // indirect

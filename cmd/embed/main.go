@@ -29,7 +29,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/ml/context"
-	"github.com/janpfeifer/treerank/internal/humanize"
+	"github.com/gomlx/gomlx/pkg/support/humanize"
 	"k8s.io/klog/v2"
 )
 
