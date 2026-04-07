@@ -6,8 +6,8 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/edsrzf/mmap-go v1.2.0
 	github.com/gomlx/exceptions v0.0.3
-	github.com/gomlx/go-huggingface v0.3.5-0.20260406073524-ceead76f438a
-	github.com/gomlx/gomlx v0.27.3-0.20260407140637-36aec8245f10
+	github.com/gomlx/go-huggingface v0.3.5-0.20260407155627-62a67b8d86ad
+	github.com/gomlx/gomlx v0.27.3-0.20260407155239-beda390e695f
 	k8s.io/klog/v2 v2.140.0
 )
 
