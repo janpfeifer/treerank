@@ -29,3 +29,47 @@ but at most 10.
 In the process it deduplicates passages (based on a hash of the passage text), creates indices to the
 _queries_ and _passages_ and only keeps the first occurrence of each passage, and share the indices when a
 passage occurs for more than one query. 
+
+## Performance Metrics
+
+### MRR (Mean-Reciprocal-Rank) formulation
+
+- All passages of all examples in a dataset split are considered as negatives
+  - But only for the split, so when evaluating on "validation", none of the passages from "train" or "test" are considered.
+- MRR uses the best ranked *is_selected* passage. So if for a query there is more than one selected passage,
+  the RR for the query is 1/n, where n is the max(rank for all selected passages).
+- The RR is then thresholded at 1/10, so if the best ranked *is_selected* passage is at a rank > 10, it is scored as 0.
+- Queries with no *is_selected* passage don't participate on the mean of MRR.
+
+### KaLM-Gemma3 12B (BFloat16), on NVidia RTX 5090
+
+- Ranked by pure cosine-similarity of the query and passage.
+
+#### Newer version:
+
+- Task: "MSMARCO"
+- Bucketing strategy: Two-bit bucket budget: 8192 tokens.
+- Padding-ratio: ~20%
+- Total time: ???
+- MRR: ~0.48
+
+#### Old version
+
+Task not set (should be "MSMARCO"), which yields much worse retrieval.
+
+- Bucketing strategy: Power-of-1.4, batch budget: 8192 tokens.
+- Padding-ratio: ~20%
+- Total time: 2h32m
+- MRR: ~0.30
+
+```
+┌────────────────┬────────┬───────────────┐
+│ Metric         │ Total  │     Speed     │
+├────────────────┼────────┼───────────────┤
+│ Queries        │ 101.1K │   11  items/s │
+│ Passages       │ 980.5K │  107  items/s │
+│ Tokens         │  86.5M │ 9.5K tokens/s │
+│ Non-Pad Tokens │  72.2M │ 7.9K tokens/s │
+└────────────────┴────────┴───────────────┘
+```
+

@@ -37,7 +37,7 @@ var (
 	flagData         = flag.String("data", "", "Data directory where files should be generated.")
 	flagLimit        = flag.Int("limit", -1, "Limit the number of queries indexed. Set <= 0 to use all.")
 	flagMSMarcoSplit = flag.String("msmarco_split", msmarco.ValidationSplit, "Split to read from MS MARCO dataset (e.g. 'train', 'validation', 'test')")
-	flagTask         = flag.String("task", "", "Task selection (for queries), it adds a prompt accordingly. "+
+	flagTask         = flag.String("task", "MSMARCO", "Task selection (for queries), it adds a prompt accordingly. "+
 		"If empty no prompt is prepended. "+
 		"Set to '?' or 'list' to list supported values.")
 )
@@ -129,7 +129,7 @@ func main() {
 	bucketsInputChan := make(chan bucket.SentenceRef)
 	bucketsOutputChan := make(chan bucket.Bucket, 10)
 	bkt := bucket.New(tokenizer).
-		ByPowerBudget(8*1024, 16, 1.4).
+		ByTwoBitBucketBudget(8*1024, 16).
 		WithMaxParallelization(-1)
 	wg.Go(func() {
 		bkt.Run(bucketsInputChan, bucketsOutputChan)
@@ -150,6 +150,9 @@ func main() {
 	splitInfo := dsInfo.DatasetInfo[msmarco.Config].Splits[*flagMSMarcoSplit]
 	totalQueries := splitInfo.NumExamples
 	fmt.Printf("- Dataset %q, split %q: %d queries in total\n", ds.ID, *flagMSMarcoSplit, totalQueries)
+	if *flagTask != "" {
+		fmt.Printf("  - Task: %q -> %q\n", *flagTask, taskPrompts.BuildQueryPrompt("...", *flagTask))
+	}
 	if limit > 0 {
 		limit = min(limit, int(totalQueries))
 	}
