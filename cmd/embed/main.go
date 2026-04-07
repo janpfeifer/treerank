@@ -13,9 +13,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
 
+	"github.com/gomlx/exceptions"
 	"github.com/gomlx/go-huggingface/datasets"
 	"github.com/gomlx/go-huggingface/examples/kalmgemma3"
 	"github.com/gomlx/go-huggingface/examples/msmarco"
+	"github.com/gomlx/go-huggingface/hub"
 	"github.com/gomlx/go-huggingface/models/transformer"
 	"github.com/gomlx/go-huggingface/tokenizers"
 	tapi "github.com/gomlx/go-huggingface/tokenizers/api"
@@ -32,10 +34,12 @@ import (
 )
 
 var (
-	flagRepository   = flag.String("repo", kalmgemma3.Repository, "Path to the repository")
 	flagData         = flag.String("data", "", "Data directory where files should be generated.")
 	flagLimit        = flag.Int("limit", -1, "Limit the number of queries indexed. Set <= 0 to use all.")
 	flagMSMarcoSplit = flag.String("msmarco_split", msmarco.ValidationSplit, "Split to read from MS MARCO dataset (e.g. 'train', 'validation', 'test')")
+	flagTask         = flag.String("task", "", "Task selection (for queries), it adds a prompt accordingly. "+
+		"If empty no prompt is prepended. "+
+		"Set to '?' or 'list' to list supported values.")
 )
 
 type Work struct {
@@ -61,6 +65,8 @@ func main() {
 		klog.Fatalf("Failed to init repo: %v", err)
 	}
 
+	taskPrompts := taskSelection(repo) // load task prompts if needed
+
 	model := mustRunWithElapsedTime("Loading model configurations", func() (*transformer.Model, error) {
 		return transformer.LoadModel(repo)
 	})
@@ -83,14 +89,13 @@ func main() {
 		padID = id
 	}
 
-	embedExec := mustRunWithElapsedTime("Compiling execution graph", func() (*context.Exec, error) {
-		exec, err := context.NewExec(backend, ctx.Checked(false), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
-			constPadID := graph.Scalar(tokens.Graph(), tokens.DType(), padID)
-			mask := graph.NotEqual(tokens, constPadID)
-			x := model.SentenceEmbeddingGraph(ctx, tokens, mask)
-			return graph.ConvertDType(x, dtypes.Float32)
-		})
-		return exec, err
+	embedExec, err := context.NewExec(backend, ctx.Checked(false), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
+		fmt.Printf("\n\t - Compiling execution graph for %s (%s tokens)\n",
+			tokens.Shape(), humanize.Count(int64(tokens.Shape().Size())))
+		constPadID := graph.Scalar(tokens.Graph(), tokens.DType(), padID)
+		mask := graph.NotEqual(tokens, constPadID)
+		x := model.SentenceEmbeddingGraph(ctx, tokens, mask)
+		return graph.ConvertDType(x, dtypes.Float32)
 	})
 
 	// Prepare output files in split sub-directory.
@@ -124,8 +129,7 @@ func main() {
 	bucketsInputChan := make(chan bucket.SentenceRef)
 	bucketsOutputChan := make(chan bucket.Bucket, 10)
 	bkt := bucket.New(tokenizer).
-		ByPower(32, 8, 2).
-		WithMaxDelay(100*time.Millisecond, true).
+		ByPowerBudget(8*1024, 16, 1.4).
 		WithMaxParallelization(-1)
 	wg.Go(func() {
 		bkt.Run(bucketsInputChan, bucketsOutputChan)
@@ -162,9 +166,13 @@ func main() {
 
 			queryID := numQueriesRead
 			numQueriesRead++
+			query := record.Query
+			if *flagTask != "" {
+				query = taskPrompts.BuildQueryPrompt(record.Query, *flagTask)
+			}
 
 			bucketsInputChan <- bucket.SentenceRef{
-				Sentence:  record.Query,
+				Sentence:  query,
 				Reference: Work{IsQuery: true, ID: queryID},
 			}
 
@@ -258,9 +266,17 @@ func main() {
 			}
 
 			batchStartTime := time.Now()
-			outTensor, err := embedExec.Exec1(inputTensor)
+			var outTensor *tensors.Tensor
+			errPanic := exceptions.TryCatch[error](func() {
+				outTensor, err = embedExec.Exec1(inputTensor)
+			})
+			if errPanic != nil {
+				fmt.Println()
+				klog.Fatalf("Panic on execute embeddings for %s: %+v", inputTensor.Shape(), errPanic)
+			}
 			if err != nil {
-				klog.Fatalf("Failed to execute embeddings: %v", err)
+				fmt.Println()
+				klog.Fatalf("Failed to execute embeddings for %s: %+v", inputTensor.Shape(), err)
 			}
 			numTokensProcessed += int64(len(bk.Batch))
 			numNonPadTokensProcessed += int64(bk.NonPadTokens)
@@ -381,7 +397,7 @@ func mustRunWithElapsedTime[T any](name string, f func() (T, error)) T {
 	if err != nil {
 		klog.Fatalf("failed: %v\n", err)
 	}
-	fmt.Printf("done (%v)\n", time.Since(start))
+	fmt.Printf("done (%s)\n", humanize.Duration(time.Since(start)))
 	return ret
 }
 
@@ -392,4 +408,28 @@ type ioWriterAt struct {
 
 func (w ioWriterAt) Write(p []byte) (n int, err error) {
 	return w.f.WriteAt(p, w.offset)
+}
+
+func taskSelection(repo *hub.Repo) kalmgemma3.TaskPrompts {
+	var taskPrompts kalmgemma3.TaskPrompts
+	if *flagTask == "" {
+		return taskPrompts
+	}
+
+	var err error
+	taskPrompts, err = kalmgemma3.LoadTaskPrompts(repo)
+	if err != nil {
+		klog.Fatalf("Failed to load task prompts: %+v", err)
+	}
+	if *flagTask == "?" || *flagTask == "list" {
+		fmt.Printf("Available task prompts:\n")
+		for task, prompt := range taskPrompts {
+			fmt.Printf("  %s: %s\n", task, prompt)
+		}
+		os.Exit(0)
+	}
+	if _, ok := taskPrompts[*flagTask]; !ok {
+		klog.Fatalf("Unknown task prompt key: %s", *flagTask)
+	}
+	return taskPrompts
 }
