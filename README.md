@@ -51,7 +51,7 @@ passage occurs for more than one query.
 - Bucketing strategy: Two-bit bucket budget: 8192 tokens.
 - Padding-ratio: ~20%
 - Total time: ???
-- MRR: ~0.48
+- MRR: ~0.4878
 
 #### Old version
 
