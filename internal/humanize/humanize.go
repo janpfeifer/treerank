@@ -3,8 +3,6 @@ package humanize
 import (
 	"fmt"
 	"math"
-	"regexp"
-	"strconv"
 	"time"
 )
 
@@ -67,15 +65,57 @@ func Speed[T ~float64 | ~float32](ratioT T, unit string) string {
 
 // Duration pretty prints duration without a long list of decimal points.
 func Duration(d time.Duration) string {
-	s := d.String()
-	re := regexp.MustCompile(`(\d+\.?\d*)([µa-z]+)`)
-	matches := re.FindStringSubmatch(s)
-	if len(matches) != 3 {
-		return s
+	if d < 0 {
+		return "-" + Duration(-d)
 	}
-	num, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil {
-		return s
+
+	const day = 24 * time.Hour
+
+	if d >= day {
+		days := d / day
+		hours := (d % day) / time.Hour
+		if hours == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return fmt.Sprintf("%dd%dh", days, hours)
 	}
-	return fmt.Sprintf("%.2f%s", num, matches[2])
+	if d >= time.Hour {
+		hours := d / time.Hour
+		minutes := (d % time.Hour) / time.Minute
+		if minutes == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	}
+	if d >= time.Minute {
+		minutes := d / time.Minute
+		seconds := (d % time.Minute) / time.Second
+		if seconds == 0 {
+			return fmt.Sprintf("%dm", minutes)
+		}
+		return fmt.Sprintf("%dm%ds", minutes, seconds)
+	}
+
+	var val float64
+	var suffix string
+
+	switch {
+	case d >= time.Second:
+		val = float64(d) / float64(time.Second)
+		suffix = "s"
+	case d >= time.Millisecond:
+		val = float64(d) / float64(time.Millisecond)
+		suffix = "ms"
+	case d >= time.Microsecond:
+		val = float64(d) / float64(time.Microsecond)
+		suffix = "µs"
+	default:
+		return fmt.Sprintf("%dns", d)
+	}
+
+	res := fmt.Sprintf("%.1f", val)
+	if len(res) >= 2 && res[len(res)-2:] == ".0" {
+		res = res[:len(res)-2]
+	}
+	return res + suffix
 }
