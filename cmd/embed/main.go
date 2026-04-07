@@ -90,8 +90,8 @@ func main() {
 	}
 
 	embedExec, err := context.NewExec(backend, ctx.Checked(false), func(ctx *context.Context, tokens *graph.Node) *graph.Node {
-		fmt.Printf("\n\t - Compiling execution graph for %s (%s tokens)\n",
-			tokens.Shape(), humanize.Count(int64(tokens.Shape().Size())))
+		// fmt.Printf("\n\t - Compiling execution graph for %s (%s tokens)\n",
+		// 	tokens.Shape(), humanize.Count(int64(tokens.Shape().Size())))
 		constPadID := graph.Scalar(tokens.Graph(), tokens.DType(), padID)
 		mask := graph.NotEqual(tokens, constPadID)
 		x := model.SentenceEmbeddingGraph(ctx, tokens, mask)
