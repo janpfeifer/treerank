@@ -15,6 +15,102 @@ import (
 	"github.com/gomlx/gomlx/pkg/support/xslices"
 )
 
+// SampleQueriesAndPassages samples numQueries and their associated passages, along with topKPassages and random passages
+// up to numPassages. It returns the sampled queries, passages, and re-mapped querying tensors.
+func (d *DataManager) SampleQueriesAndPassages(backend backends.Backend, numQueries, numPassages, topKPassages int) (
+	queries, passages, queriesIsSelected, queriesPassageIDs *tensors.Tensor, err error) {
+	// (A) Sample queryIDs
+	queryIDs := d.SampleQueries(numQueries, numPassages)
+
+	// Load queries
+	queries, err = d.LoadQueriesByIDs(backend, queryIDs...)
+	if err != nil {
+		return
+	}
+
+	// Load queriesIsSelected
+	queriesIsSelected, err = d.LoadIsSelectedForQueries(backend, queryIDs...)
+	if err != nil {
+		return
+	}
+
+	// passageIDsSet to hold all our unique passage IDs
+	passageIDsSet := sets.Make[int32](numPassages)
+
+	// Add passages directly associated with the sampled queries
+	associatedPassageIDsLocal, originalQueriesPassageIDsLocal, err := d.LoadPassagesForQueries(backend, queryIDs...)
+	if err != nil {
+		return
+	}
+	for _, passageID := range associatedPassageIDsLocal {
+		passageIDsSet.Insert(int32(passageID))
+	}
+
+	// (B) Add topK passages associated with the sampled queries
+	var topKPassageIDs *tensors.Tensor
+	topKPassageIDs, _, err = d.TopKPassagesForQueries(backend, queries, topKPassages, 0, false)
+	if err != nil {
+		originalQueriesPassageIDsLocal.FinalizeAll()
+		return
+	}
+	err = tensors.ConstFlatData(topKPassageIDs, func(flatTopKPassageIDs []int32) {
+		for _, passageID := range flatTopKPassageIDs {
+			if passageID >= 0 {
+				passageIDsSet.Insert(int32(passageID))
+			}
+		}
+	})
+	topKPassageIDs.FinalizeAll() // free up memory since we don't need the tensor anymore
+	if err != nil {
+		originalQueriesPassageIDsLocal.FinalizeAll()
+		return
+	}
+
+	// (C) Sample unique random passages until the total number of sampled messages reach numPassages
+	for len(passageIDsSet) < numPassages {
+		passageID := rand.IntN(d.NumPassages)
+		passageIDsSet.Insert(int32(passageID))
+	}
+
+	// Now proceed to load them
+	finalPassageIDs := xslices.SortedKeys(passageIDsSet)
+	finalPassageIDsInt := make([]int, len(finalPassageIDs))
+	for i, v := range finalPassageIDs {
+		finalPassageIDsInt[i] = int(v)
+	}
+	passages, err = d.LoadPassagesByIDs(backend, finalPassageIDsInt...)
+	if err != nil {
+		originalQueriesPassageIDsLocal.FinalizeAll()
+		return
+	}
+
+	// Create reverse mapping
+	globalToSampledIdx := make(map[int32]int32, len(finalPassageIDs))
+	for idx, id := range finalPassageIDs {
+		globalToSampledIdx[id] = int32(idx)
+	}
+
+	flatQueriesPassageIDs := make([]int32, numQueries*PassagesPerQuery)
+	err = tensors.ConstFlatData(originalQueriesPassageIDsLocal, func(flatOriginalQueriesPassageIDs []int32) {
+		for i, localPassageIdx := range flatOriginalQueriesPassageIDs {
+			if localPassageIdx >= 0 {
+				globalPassageID := associatedPassageIDsLocal[localPassageIdx]
+				flatQueriesPassageIDs[i] = globalToSampledIdx[int32(globalPassageID)]
+			} else {
+				flatQueriesPassageIDs[i] = -1
+			}
+		}
+	})
+	originalQueriesPassageIDsLocal.FinalizeAll()
+	if err != nil {
+		return
+	}
+
+	queriesPassageIDs = tensors.FromFlatDataAndDimensions(flatQueriesPassageIDs, numQueries, PassagesPerQuery)
+
+	return
+}
+
 // SampleQueries samples numQueries queries without replacement (all queryIDs are unique) from the dataset.
 //
 // It returns:
