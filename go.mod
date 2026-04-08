@@ -6,7 +6,7 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/edsrzf/mmap-go v1.2.0
 	github.com/gomlx/exceptions v0.0.3
-	github.com/gomlx/go-huggingface v0.3.5-0.20260407155627-62a67b8d86ad
+	github.com/gomlx/go-huggingface v0.3.5-0.20260408062022-b374c3074a14
 	github.com/gomlx/gomlx v0.27.3-0.20260407155239-beda390e695f
 	k8s.io/klog/v2 v2.140.0
 )
@@ -37,6 +37,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/twpayne/go-geom v1.6.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect

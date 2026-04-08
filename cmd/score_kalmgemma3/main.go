@@ -3,8 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/gomlx/go-huggingface/datasets"
+	"github.com/gomlx/go-huggingface/examples/msmarco"
 	"github.com/gomlx/gomlx/backends"
 	_ "github.com/gomlx/gomlx/backends/default"
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
@@ -13,19 +17,27 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/support/humanize"
 	"github.com/janpfeifer/treerank/internal/datamanager"
+	"github.com/parquet-go/parquet-go"
+	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
 )
 
 var (
-	flagData = flag.String("data", "", "Data directory where files should be generated.")
+	flagData    = pflag.String("data", "", "Data directory where files should be generated.")
+	flagQueries = pflag.IntSlice("queries", nil, "Queries to score (indices). If empty, all queries are scored. "+
+		"If set, it will also display the query text, as well as the Top-1 passage text and the selected passages.")
+	flagMSMarcoSplit = flag.String("msmarco_split", msmarco.ValidationSplit,
+		"Split to read from MS MARCO dataset (e.g. 'train', 'validation', 'test') used to diplay the queries. "+
+			"It must match the split used to generate the data.")
 )
 
 func main() {
 	klog.InitFlags(nil)
-	flag.Parse()
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine) // Add klog flags.
+	pflag.Parse()
 
 	if *flagData == "" {
-		klog.Exit("-data <data directory> must be specified")
+		klog.Exit("--data <data directory> must be specified")
 	}
 
 	dm := must1(datamanager.New(*flagData))
@@ -33,23 +45,31 @@ func main() {
 	backend := must1(backends.New())
 	defer backend.Finalize()
 
+	// Print dataset and selected queries info.
 	fmt.Printf("Dataset in %s:\n", *flagData)
-	fmt.Printf("  - Queries:  %d\n", dm.NumQueries)
-	fmt.Printf("  - Passages: %d\n", dm.NumPassages)
+	fmt.Printf("  - Total queries:  %d\n", dm.NumQueries)
+	fmt.Printf("  - Total passages: %d\n", dm.NumPassages)
+	queryIDs := *flagQueries
+	if len(queryIDs) > 0 {
+		for _, queryID := range queryIDs {
+			if queryID < 0 || queryID >= dm.NumQueries {
+				klog.Exitf("queryID %d (passed by --queries) is out of bounds [0, %d)", queryID, dm.NumQueries)
+			}
+		}
+		fmt.Printf("  - Queries to score: %v\n", queryIDs)
+	}
 
 	// Investigate the distribution of selected passages per query.
 	queryIsSelected := must1(dm.LoadQueryIsSelected(backend))
-	perCount := must1(ExecOnce(backend, func(queryIsSelected *Node) *Node {
-		g := queryIsSelected.Graph()
-		numSelected := GreaterThan(queryIsSelected, ScalarZero(g, queryIsSelected.DType()))
-		countSelected := ReduceSum(ConvertDType(numSelected, dtypes.Int8), 1)
-
-		perCount := IotaFull(g, shapes.Make(dtypes.Int8, 1, 10))      // Shape: [1, 10]
-		perCount = Equal(ExpandAxes(countSelected, -1), perCount)     // Shape: [NumQueries, 10]Bool
-		perCount = ReduceSum(ConvertDType(perCount, dtypes.Int32), 0) // Shape: [10]Int32
-		return perCount
-	}, queryIsSelected))
-	fmt.Printf("  - Queries: count of #selected: %v\n", perCount.Value().([]int32))
+	PrintCountNumberSelected(backend, queryIsSelected)
+	if len(queryIDs) > 0 {
+		queryIsSelected = must1(ExecOnce(backend, func(queryIsSelected, queriesToScore *Node) *Node {
+			return Gather(queryIsSelected, ExpandAxes(queriesToScore, -1))
+		}, queryIsSelected, queryIDs))
+		if queryIsSelected.Rank() != 2 && queryIsSelected.Shape().Dim(0) != len(queryIDs) {
+			klog.Exitf("Expected %d queries selected, got %s", len(queryIDs), queryIsSelected.Shape())
+		}
+	}
 
 	// Update MRR computation by selecting the topK passages for each query.
 	const K = 10
@@ -89,13 +109,28 @@ func main() {
 		return currentTopKPassagesPerQueryIndices, currentTopKPassagesPerQueryScores
 	}))
 
-	// Calculate the MRR of the queries.
-	queries := must1(dm.LoadQueries(backend))
+	// Load queries.
+	var queries *tensors.Tensor
+	if len(queryIDs) == 0 {
+		queries = must1(dm.LoadQueries(backend))
+	} else if len(queryIDs) == 1 {
+		queries = must1(dm.LoadQuery(backend, queryIDs[0]))
+		queries = must1(ExecOnce(backend, func(query *Node) *Node { return ExpandAxes(query, 0) }, queries))
+	} else {
+		queryParts := make([]any, 0, len(queryIDs))
+		for _, queryID := range queryIDs {
+			queryParts = append(queryParts, must1(dm.LoadQuery(backend, queryID)))
+		}
+		queries = must1(ExecOnce(backend, func(queryParts []*Node) *Node { return Stack(queryParts, 0) }, queryParts...))
+	}
+	if queries.Rank() != 2 || queries.Shape().Dim(0) != len(queryIDs) {
+		klog.Exitf("Expected %d queries, got %s", len(queryIDs), queries.Shape())
+	}
 	const passagesBatchSize = 32
 
 	// currentTopKPassagesPerQuery starts with 0 passages selected, and keeps being updated with the topK for each batch.
-	currentTopKPassagesPerQueryIndices := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Int32, dm.NumQueries, 0)))
-	currentTopKPassagesPerQueryScores := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Float32, dm.NumQueries, 0)))
+	currentTopKPassagesPerQueryIndices := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Int32, queries.Shape().Dim(0), 0)))
+	currentTopKPassagesPerQueryScores := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Float32, queries.Shape().Dim(0), 0)))
 	start := time.Now()
 	lastUpdate := start
 	var passagesBaseIdx int
@@ -118,7 +153,7 @@ func main() {
 		lastUpdate = time.Now()
 	}
 
-	// Loop at a batch of passages at a time.
+	// Loop at a batch of passages at a time, scoring them against the queries loaded.
 	for passagesBaseIdx = 0; passagesBaseIdx < dm.NumPassages; passagesBaseIdx += passagesBatchSize {
 		if time.Since(lastUpdate) > 1*time.Second {
 			printStatusFn()
@@ -136,9 +171,20 @@ func main() {
 	fmt.Printf("- Elapsed time: %s\n", humanize.Duration(time.Since(start)))
 	updateMRRExec.Finalize()
 
+	// Load queryIndices: map of queryID -> list of passageIDs
+	allQueryIndices := must1(dm.LoadQueryIndices(backend))
+	queryIndices := allQueryIndices
+	if len(queryIDs) > 0 {
+		queryIndices = must1(ExecOnce(backend, func(queryIndices, queryIDs *Node) *Node {
+			return Gather(queryIndices, ExpandAxes(queryIDs, -1))
+		}, queryIndices, queryIDs))
+		if queryIndices.Rank() != 2 && queryIndices.Shape().Dim(0) != len(queryIDs) {
+			klog.Exitf("Expected %d queries indices, got %s", len(queryIDs), queryIndices.Shape())
+		}
+	}
+
 	// Now that we have the TopK passages for each query, we can compute the MRR, by checking if any of them
 	// are the selected passages for the query.
-	queryIndices := must1(dm.LoadQueryIndices(backend))
 	mrr := must1(ExecOnce(backend, func(queryIndices, queryIsSelected, currentTopKPassagesPerQueryIndices *Node) *Node {
 		g := queryIndices.Graph()
 		dtypeInt := dtypes.Int32
@@ -176,21 +222,121 @@ func main() {
 		return mrr
 	}, queryIndices, queryIsSelected, currentTopKPassagesPerQueryIndices))
 	fmt.Printf("MRR: %s\n", mrr)
-}
 
-func must(err error) {
-	if err != nil {
-		klog.Errorf("Must failed: %+v", err)
-		panic(err)
+	if len(queryIDs) > 0 {
+		PrintQueries(queryIDs, queryIsSelected, allQueryIndices, currentTopKPassagesPerQueryIndices)
 	}
 }
 
-func must1[T any](v T, err error) T {
-	must(err)
-	return v
+// PrintQueries prints the text of the queries, the selected passages and the top passage of each query.
+func PrintQueries(queryIDs []int, queryIsSelected, allQueryIndices, topKPassagesPerQueryIndices *tensors.Tensor) {
+	// Get top scored passages for each query
+	topPassageIDs := make([]int, len(queryIDs))
+	tensors.ConstFlatData(topKPassagesPerQueryIndices, func(flatTopK []int32) {
+		stride := topKPassagesPerQueryIndices.Shape().Dim(1)
+		for i := range queryIDs {
+			topPassageIDs[i] = int(flatTopK[i*stride])
+		}
+	})
+
+	// Get query IDs that hold the top passages -- they are not necessarily the same as the queryIDs we are listing.
+	topPassageQueryIDs := make([]int, len(queryIDs))
+	topPassageQuerySubIndex := make([]int, len(queryIDs))
+	tensors.ConstFlatData(allQueryIndices, func(flatQueryIndices []int32) {
+		stride := allQueryIndices.Shape().Dim(1)
+		numFound := 0
+		for queryIndicesFlatIdx, passageID := range flatQueryIndices {
+			for topIdx, topPassageID := range topPassageIDs {
+				if topPassageID != int(passageID) {
+					continue
+				}
+				topPassageQueryIDs[topIdx] = queryIndicesFlatIdx / stride
+				topPassageQuerySubIndex[topIdx] = queryIndicesFlatIdx % stride
+				numFound++
+			}
+			if numFound == len(topPassageIDs) {
+				break
+			}
+		}
+		if numFound != len(topPassageIDs) {
+			klog.Fatalf("Expected %d top passages, found %d", len(topPassageIDs), numFound)
+		}
+	})
+
+	// Get reader from dataset, so we can fetch the text of the queries and passages.
+	ds := datasets.New(msmarco.ID)
+	dsInfo := must1(ds.Info())
+	if !MapHas(dsInfo.DatasetInfo, msmarco.Config) || !MapHas(dsInfo.DatasetInfo[msmarco.Config].Splits, *flagMSMarcoSplit) {
+		klog.Fatalf("Dataset %q doesn't contents for config=%q / split=%q", ds.ID, msmarco.Config, *flagMSMarcoSplit)
+	}
+	reader := must1(datasets.CreateParquetReader[msmarco.MsMarcoRecord](ds, msmarco.Config, *flagMSMarcoSplit))
+	defer reader.Close()
+
+	separator := lipgloss.NewStyle().Foreground(lipgloss.Color("238")).Render(strings.Repeat("─", 120))
+	queryStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#80FF80"))
+	passageStyle := lipgloss.NewStyle().Faint(true)
+
+	for queryIDIdx, queryID := range queryIDs {
+		record := getQueryRecord(reader, queryID)
+		fmt.Println(separator)
+		fmt.Printf("Query #%d: %s\n", queryID, queryStyle.Render(record.Query))
+
+		countSelected := 0
+		for i, isSelected := range record.Passages.IsSelected {
+			if isSelected > 0 {
+				fmt.Printf("  - Selected #%d: %s\n", countSelected+1,
+					passageStyle.Render(record.Passages.PassageText[i]))
+				countSelected++
+			}
+		}
+		if countSelected == 0 {
+			fmt.Printf("  - No passages selected\n")
+		}
+
+		fmt.Printf("  - Top scored passage (from query #%d, passage #%d):\n",
+			topPassageQueryIDs[queryIDIdx], topPassageQuerySubIndex[queryIDIdx])
+		topRecord := getQueryRecord(reader, topPassageQueryIDs[queryIDIdx])
+		topPassage := topRecord.Passages.PassageText[topPassageQuerySubIndex[queryIDIdx]]
+		fmt.Printf("    %s\n", passageStyle.Render(topPassage))
+	}
+	fmt.Println(separator)
 }
 
-func must2[T1, T2 any](v1 T1, v2 T2, err error) (T1, T2) {
-	must(err)
-	return v1, v2
+func getQueryRecord(reader *parquet.GenericReader[msmarco.MsMarcoRecord], rowID int) msmarco.MsMarcoRecord {
+	batch := make([]msmarco.MsMarcoRecord, 1)
+	reader.SeekToRow(int64(rowID))
+	n := must1(reader.Read(batch))
+	if n != 1 {
+		klog.Fatalf("Expected 1 record, got %d", n)
+	}
+	return batch[0]
+}
+
+func MapHas[K comparable, V any](m map[K]V, k K) bool {
+	_, ok := m[k]
+	return ok
+}
+
+func PrintCountNumberSelected(backend backends.Backend, queryIsSelected *tensors.Tensor) {
+	perCount := must1(ExecOnce(backend, func(queryIsSelected *Node) *Node {
+		g := queryIsSelected.Graph()
+		numSelected := GreaterThan(queryIsSelected, ScalarZero(g, queryIsSelected.DType()))
+		countSelected := ReduceSum(ConvertDType(numSelected, dtypes.Int8), 1)
+
+		perCount := IotaFull(g, shapes.Make(dtypes.Int8, 1, 10))      // Shape: [1, 10]
+		perCount = Equal(ExpandAxes(countSelected, -1), perCount)     // Shape: [NumQueries, 10]Bool
+		perCount = ReduceSum(ConvertDType(perCount, dtypes.Int32), 0) // Shape: [10]Int32
+		return perCount
+	}, queryIsSelected))
+	counts := perCount.Value().([]int32)
+	fmt.Printf("  - Distribution of selected passages: ([<num_selected_passages>:<num_queries>])\n")
+	fmt.Printf("    - ")
+	comma := ""
+	for numSelected, count := range counts {
+		if count > 0 {
+			fmt.Printf("%s[%d:%d]", comma, numSelected, count)
+			comma = ", "
+		}
+	}
+	fmt.Println()
 }
