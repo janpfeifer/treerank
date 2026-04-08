@@ -10,6 +10,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -133,14 +134,74 @@ func (d *DataManager) LoadPassage(backend backends.Backend, passageID int) (*ten
 	return tensors.FromRaw(backend, 0, shape, []byte(d.PassagesMMap)[start:end])
 }
 
-// LoadQueries loads all the queries into one large tensor shaped [NumQueries, EmbeddingSize].
-func (d *DataManager) LoadQueries(backend backends.Backend) (*tensors.Tensor, error) {
+// LoadAllQueries loads all the queries into one large tensor shaped [NumQueries, EmbeddingSize].
+func (d *DataManager) LoadAllQueries(backend backends.Backend) (*tensors.Tensor, error) {
 	shape := shapes.Make(dtypes.Float32, d.NumQueries, EmbeddingSize)
 	return tensors.FromRaw(backend, 0, shape, []byte(d.QueriesMMap))
 }
 
-// LoadPassages loads all the passages into one large tensor shaped [NumPassages, EmbeddingSize].
-func (d *DataManager) LoadPassages(backend backends.Backend) (*tensors.Tensor, error) {
+// LoadQueriesByIDs loads queries identified by queryIDs into a tensor.
+// The returned tensor will have shape [len(queryIDs), EmbeddingSize].
+//
+// For efficiency, sort the queryIDs before calling this.
+func (d *DataManager) LoadQueriesByIDs(backend backends.Backend, queryIDs ...int) (*tensors.Tensor, error) {
+	shape := shapes.Make(dtypes.Float32, len(queryIDs), EmbeddingSize)
+	t, err := tensors.FromShapeForBackend(backend, 0, shape)
+	if err != nil {
+		return nil, err
+	}
+	t.MutableBytes(func(tensorBytes []byte) {
+		for i, queryID := range queryIDs {
+			if queryID < 0 || queryID >= d.NumQueries {
+				err = errors.Errorf("queryID %d (at index %d) out of bounds [0, %d)", queryID, i, d.NumQueries)
+				return
+			}
+			dsStart := queryID * EmbeddingByteSize
+			dsEnd := dsStart + EmbeddingByteSize
+			tStart := i * EmbeddingByteSize
+			tEnd := tStart + EmbeddingByteSize
+			copy(tensorBytes[tStart:tEnd], []byte(d.QueriesMMap)[dsStart:dsEnd])
+		}
+	})
+	if err != nil {
+		t.FinalizeAll()
+		return nil, err
+	}
+	return t, nil
+}
+
+// LoadPassagesByIDs loads passages identified by passageIDs into a tensor.
+// The returned tensor will have shape [len(passageIDs), EmbeddingSize].
+//
+// For efficiency, sort the passageIDs before calling this.
+func (d *DataManager) LoadPassagesByIDs(backend backends.Backend, passageIDs ...int) (*tensors.Tensor, error) {
+	shape := shapes.Make(dtypes.Float32, len(passageIDs), EmbeddingSize)
+	t, err := tensors.FromShapeForBackend(backend, 0, shape)
+	if err != nil {
+		return nil, err
+	}
+	t.MutableBytes(func(tensorBytes []byte) {
+		for i, passageID := range passageIDs {
+			if passageID < 0 || passageID >= d.NumPassages {
+				err = errors.Errorf("passageID %d (at index %d) out of bounds [0, %d)", passageID, i, d.NumPassages)
+				return
+			}
+			dsStart := passageID * EmbeddingByteSize
+			dsEnd := dsStart + EmbeddingByteSize
+			tStart := i * EmbeddingByteSize
+			tEnd := tStart + EmbeddingByteSize
+			copy(tensorBytes[tStart:tEnd], []byte(d.PassagesMMap)[dsStart:dsEnd])
+		}
+	})
+	if err != nil {
+		t.FinalizeAll()
+		return nil, err
+	}
+	return t, nil
+}
+
+// LoadAllPassages loads all the passages into one large tensor shaped [NumPassages, EmbeddingSize].
+func (d *DataManager) LoadAllPassages(backend backends.Backend) (*tensors.Tensor, error) {
 	shape := shapes.Make(dtypes.Float32, d.NumPassages, EmbeddingSize)
 	return tensors.FromRaw(backend, 0, shape, []byte(d.PassagesMMap))
 }

@@ -112,19 +112,9 @@ func main() {
 	// Load queries.
 	var queries *tensors.Tensor
 	if len(queryIDs) == 0 {
-		queries = must1(dm.LoadQueries(backend))
-	} else if len(queryIDs) == 1 {
-		queries = must1(dm.LoadQuery(backend, queryIDs[0]))
-		queries = must1(ExecOnce(backend, func(query *Node) *Node { return ExpandAxes(query, 0) }, queries))
+		queries = must1(dm.LoadAllQueries(backend))
 	} else {
-		queryParts := make([]any, 0, len(queryIDs))
-		for _, queryID := range queryIDs {
-			queryParts = append(queryParts, must1(dm.LoadQuery(backend, queryID)))
-		}
-		queries = must1(ExecOnce(backend, func(queryParts []*Node) *Node { return Stack(queryParts, 0) }, queryParts...))
-	}
-	if queries.Rank() != 2 || queries.Shape().Dim(0) != len(queryIDs) {
-		klog.Exitf("Expected %d queries, got %s", len(queryIDs), queries.Shape())
+		queries = must1(dm.LoadQueriesByIDs(backend, queryIDs...))
 	}
 	const passagesBatchSize = 32
 
