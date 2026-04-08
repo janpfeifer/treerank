@@ -1,10 +1,16 @@
 package datamanager
 
 import (
+	"fmt"
 	"math/rand/v2"
+	"time"
 
 	"github.com/gomlx/gomlx/backends"
+	"github.com/gomlx/gomlx/pkg/core/dtypes"
+	. "github.com/gomlx/gomlx/pkg/core/graph"
+	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
+	"github.com/gomlx/gomlx/pkg/support/humanize"
 	"github.com/gomlx/gomlx/pkg/support/sets"
 	"github.com/gomlx/gomlx/pkg/support/xslices"
 )
@@ -27,10 +33,12 @@ func (d *DataManager) SampleQueries(numQueries, numPassages int) (queryIDs []int
 
 // TopKPassagesForQueries returns the top k passages for each query in queryIDs.
 //
+//   - backend: where to run the computations.
 //   - queries: tensor of shape [len(queryIDs), embedding_dim] containing the query embeddings of
 //     the queries to score.
-//   - passages: tensor of shape [numPassages, embedding_dim] containing the all the passage embeddings
-//     considered.
+//   - k: the number of top passages to return for each query.
+//   - passagesBatchSize: number of passages to process at a time. If 0, it will be set to 128, a good default.
+//   - showProgress: true if the progress (along an ETA) should be printed to the console.
 //
 // It returns:
 //
@@ -38,6 +46,121 @@ func (d *DataManager) SampleQueries(numQueries, numPassages int) (queryIDs []int
 //     It is initialized (padded) with -1, in case there are less than k passages.
 //   - topKScores: tensor of shape [len(queryIDs), k]Float32 containing the scores (cosine-similarity) of the top k passages for each query.
 //     It is initialized (padded) with -inf, in case there are less than k passages.
-func (d *DataManager) TopKPassagesForQueries(backend backends.Backend, queries *tensors.Tensor, passages *tensors.Tensor, k int) (topKPassageIDs, topKScores *tensors.Tensor) {
-	return
+func (d *DataManager) TopKPassagesForQueries(
+	backend backends.Backend, queries *tensors.Tensor, k int,
+	passagesBatchSize int, showProgress bool) (
+	topKPassageIDs, topKScores *tensors.Tensor, err error) {
+	dtypeFloat := queries.DType()
+	dtypeInt := dtypes.Int32
+
+	if passagesBatchSize == 0 {
+		passagesBatchSize = 128
+	}
+	updateTopKExec, err := NewExec(backend, func(queries, passagesBatch, passagesBatchBaseID, currentTopKPassageIDs, currentTopKScores *Node) (*Node, *Node) {
+		g := queries.Graph()
+		numQueries := queries.Shape().Dim(0)
+		numPassagesBatch := passagesBatch.Shape().Dim(0)
+
+		// 1. Scores for the new batch: cosine similarity
+		newScores := CrossCosineSimilarity(queries, passagesBatch, -1, 0)
+		currentTopKScores = Concatenate([]*Node{currentTopKScores, newScores}, -1)
+
+		// 2. Indices for the new batch
+		newIndices := Add(Iota(g, shapes.Make(dtypeInt, numQueries, numPassagesBatch), 1), passagesBatchBaseID)
+		currentTopKPassageIDs = Concatenate([]*Node{currentTopKPassageIDs, newIndices}, -1)
+
+		// 3. Sort currentTopK... by their descending scores (similarity)
+		compareScores := NewClosure(g, func(g *Graph) []*Node {
+			lhsScore := Parameter(g, "lhsScore", shapes.Make(dtypeFloat))
+			rhsScore := Parameter(g, "rhsScore", shapes.Make(dtypeFloat))
+			_ = Parameter(g, "lhsIndex", shapes.Make(dtypeInt))
+			_ = Parameter(g, "rhsIndex", shapes.Make(dtypeInt))
+			return []*Node{GreaterThan(lhsScore, rhsScore)}
+		})
+		sorted := SortFunc(compareScores, 1, false, currentTopKScores, currentTopKPassageIDs)
+		currentTopKScores = sorted[0]
+		currentTopKPassageIDs = sorted[1]
+
+		// 4. Truncate to take only the TopK
+		if currentTopKScores.Shape().Dim(1) > k {
+			currentTopKScores = Slice(currentTopKScores, AxisRange(), AxisRangeFromStart(k))
+			currentTopKPassageIDs = Slice(currentTopKPassageIDs, AxisRange(), AxisRangeFromStart(k))
+		}
+		return currentTopKPassageIDs, currentTopKScores
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer updateTopKExec.Finalize()
+
+	// Initialize topKPassageIDs and topKScores with -1 and -inf respectively.
+	numQueries := queries.Shape().Dim(0)
+	numPassages := d.NumPassages
+	res, err := ExecOnceN(backend, func(g *Graph) (*Node, *Node) {
+		ids := BroadcastToDims(Scalar(g, dtypeInt, -1), numQueries, k)
+		scores := BroadcastToDims(Infinity(g, dtypeFloat, -1), numQueries, k)
+		return ids, scores
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	topKPassageIDs = res[0]
+	topKScores = res[1]
+
+	// Loop variables:
+	start := time.Now()
+	lastUpdate := start
+	var passagesBaseIdx int
+
+	// Print progress status function.
+	printStatusFn := func() {
+		prefix, eta := " -", "Unknown"
+		elapsed := time.Since(start)
+		remaining := numPassages - passagesBaseIdx
+		if remaining <= 0 {
+			// Last update, we append a new-line.
+			eta = fmt.Sprintf("Elapsed time: %s\n", humanize.Duration(time.Since(start)))
+			prefix = "✅"
+		} else if passagesBaseIdx > 0 && elapsed > 0 {
+			speed := float64(passagesBaseIdx) / elapsed.Seconds()
+			eta = "ETA: " + humanize.Duration(time.Duration(float64(remaining)/speed)*time.Second)
+		}
+		fmt.Printf("\r%s Scoring %s queries x %s / %s passages (%.1f%%) -- %s %s",
+			prefix, humanize.Count(numQueries), humanize.Count(passagesBaseIdx), humanize.Count(numPassages),
+			float64(passagesBaseIdx)/float64(numPassages)*100, eta, humanize.EraseToEndOfLine)
+		lastUpdate = time.Now()
+	}
+
+	// Loop over passages, a batch at a time.
+	for passagesBaseIdx = 0; passagesBaseIdx < numPassages; passagesBaseIdx += passagesBatchSize {
+		if showProgress && time.Since(lastUpdate) > 1*time.Second {
+			printStatusFn()
+			lastUpdate = time.Now()
+		}
+		thisBatchSize := min(passagesBatchSize, numPassages-passagesBaseIdx)
+		passagesBatch, err := d.LoadPassagesBatch(backend, passagesBaseIdx, thisBatchSize)
+		if err != nil {
+			return nil, nil, err
+		}
+		donatedIDs, err := DonateTensorBuffer(topKPassageIDs, backend, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		donatedScores, err := DonateTensorBuffer(topKScores, backend, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		res, err = updateTopKExec.Exec(queries, passagesBatch, int32(passagesBaseIdx), donatedIDs, donatedScores)
+		if err != nil {
+			return nil, nil, err
+		}
+		topKPassageIDs = res[0]
+		topKScores = res[1]
+		passagesBatch.FinalizeAll()
+	}
+	if showProgress {
+		printStatusFn()
+	}
+
+	return topKPassageIDs, topKScores, nil
 }

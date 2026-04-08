@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gomlx/go-huggingface/datasets"
@@ -15,7 +14,6 @@ import (
 	. "github.com/gomlx/gomlx/pkg/core/graph"
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
-	"github.com/gomlx/gomlx/pkg/support/humanize"
 	"github.com/janpfeifer/treerank/pkg/datamanager"
 	"github.com/parquet-go/parquet-go"
 	"github.com/spf13/pflag"
@@ -68,44 +66,6 @@ func main() {
 	}
 	PrintCountNumberSelected(backend, queriesIsSelected)
 
-	// Update MRR computation by selecting the topK passages for each query.
-	const K = 10
-	updateMRRExec := must1(NewExec(backend, func(queries, passagesBatch, passagesBatchBaseID, currentTopKPassagesPerQueryPassageIDs, currentTopKPassagesPerQueryScores *Node) (*Node, *Node) {
-		// fmt.Printf("Shapes: %s, %s, %s, %s, %s\n", queries.Shape(), passagesBatch.Shape(), passagesBaseIdx.Shape(), currentTopKPassagesPerQueryIndices.Shape(), currentTopKPassagesPerQueryScores.Shape())
-		g := queries.Graph()
-		dtype := queries.DType()
-		numQueries := queries.Shape().Dim(0)
-		numPassagesBatch := passagesBatch.Shape().Dim(0)
-
-		// 1. Scores for the new batch: cosine similarity, shape [NumQueries, NumPassagesBatch]
-		newScores := CrossCosineSimilarity(queries, passagesBatch, -1, 0)
-		currentTopKPassagesPerQueryScores = Concatenate([]*Node{currentTopKPassagesPerQueryScores, newScores}, -1) // [NumQueries, K + NumPassagesBatch]
-
-		// 2. Indices for the new batch:
-		newIndices := Add(Iota(g, shapes.Make(dtypes.Int32, numQueries, numPassagesBatch), 1), passagesBatchBaseID)
-		currentTopKPassagesPerQueryPassageIDs = Concatenate([]*Node{currentTopKPassagesPerQueryPassageIDs, newIndices}, -1) // [NumQueries, K + NumPassagesBatch]
-
-		// 4. Sort currentTopK... by their descending scores (similarity)
-		compareScores := NewClosure(g, func(g *Graph) []*Node {
-			lhsScore := Parameter(g, "lhsScore", shapes.Make(dtype))
-			rhsScore := Parameter(g, "rhsScore", shapes.Make(dtype))
-			_ = Parameter(g, "lhsIndex", shapes.Make(dtypes.Int32))
-			_ = Parameter(g, "rhsIndex", shapes.Make(dtypes.Int32))
-			return []*Node{GreaterThan(lhsScore, rhsScore)}
-		})
-		sorted := SortFunc(compareScores, 1, false, currentTopKPassagesPerQueryScores, currentTopKPassagesPerQueryPassageIDs)
-		currentTopKPassagesPerQueryScores = sorted[0]
-		currentTopKPassagesPerQueryPassageIDs = sorted[1]
-
-		// 5. Truncate to take only the TopK
-		if currentTopKPassagesPerQueryScores.Shape().Dim(1) > K {
-			currentTopKPassagesPerQueryScores = Slice(currentTopKPassagesPerQueryScores, AxisRange(), AxisRangeFromStart(K))
-			currentTopKPassagesPerQueryPassageIDs = Slice(currentTopKPassagesPerQueryPassageIDs, AxisRange(), AxisRangeFromStart(K))
-		}
-
-		return currentTopKPassagesPerQueryPassageIDs, currentTopKPassagesPerQueryScores
-	}))
-
 	// Load queries.
 	var queries *tensors.Tensor
 	if len(queryIDs) == 0 {
@@ -115,48 +75,9 @@ func main() {
 	}
 	const passagesBatchSize = 32
 
-	// currentTopKPassagesPerQuery starts with 0 passages selected, and keeps being updated with the topK for each batch.
-	currentTopKPassagesPerQueryPassageIDs := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Int32, queries.Shape().Dim(0), 0)))
-	currentTopKPassagesPerQueryScores := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Float32, queries.Shape().Dim(0), 0)))
-	start := time.Now()
-	lastUpdate := start
-	var passagesBaseIdx int
-	printStatusFn := func() {
-		eta := "Unknown"
-		elapsed := time.Since(start)
-		remaining := dm.NumPassages - passagesBaseIdx
-		if passagesBaseIdx > 0 && elapsed > 0 {
-			speed := float64(passagesBaseIdx) / elapsed.Seconds()
-			eta = humanize.Duration(time.Duration(float64(remaining)/speed) * time.Second)
-		}
-		if remaining == 0 {
-			eta = ""
-		} else {
-			eta = " -- ETA: " + eta
-		}
-		fmt.Printf("\r- Processed %s / %s passages (%.1f%%)%s %s",
-			humanize.Count(passagesBaseIdx), humanize.Count(dm.NumPassages),
-			float64(passagesBaseIdx)/float64(dm.NumPassages)*100, eta, humanize.EraseToEndOfLine)
-		lastUpdate = time.Now()
-	}
-
-	// Loop at a batch of passages at a time, scoring them against the queries loaded.
-	for passagesBaseIdx = 0; passagesBaseIdx < dm.NumPassages; passagesBaseIdx += passagesBatchSize {
-		if time.Since(lastUpdate) > 1*time.Second {
-			printStatusFn()
-			lastUpdate = time.Now()
-		}
-		thisBatchSize := min(passagesBatchSize, dm.NumPassages-passagesBaseIdx)
-		passagesBatch := must1(dm.LoadPassagesBatch(backend, passagesBaseIdx, thisBatchSize))
-		currentTopKPassagesPerQueryPassageIDs, currentTopKPassagesPerQueryScores = must2(updateMRRExec.Exec2(
-			queries, passagesBatch, int32(passagesBaseIdx),
-			must1(DonateTensorBuffer(currentTopKPassagesPerQueryPassageIDs, backend, 0)),
-			must1(DonateTensorBuffer(currentTopKPassagesPerQueryScores, backend, 0))))
-	}
-	printStatusFn()
-	fmt.Println()
-	fmt.Printf("- Elapsed time: %s\n", humanize.Duration(time.Since(start)))
-	updateMRRExec.Finalize()
+	// Get the topKPassagesPerQuery, K=10. They are returned as passage IDs.
+	const K = 10
+	topKPassagesPerQuery, _ := must2(dm.TopKPassagesForQueries(backend, queries, K, 0, true))
 
 	// Load queryIndices: map of queryID -> list of passageIDs
 	allQueriesPassageIDs := must1(dm.LoadQueriesPassageIDs(backend))
@@ -207,11 +128,11 @@ func main() {
 		validQueries = Max(validQueries, oneFloat)                                               // Avoid division by zero.
 		mrr := Div(ReduceSum(rrScores), validQueries)
 		return mrr
-	}, queryPassageIDs, queriesIsSelected, currentTopKPassagesPerQueryPassageIDs))
+	}, queryPassageIDs, queriesIsSelected, topKPassagesPerQuery))
 	fmt.Printf("MRR: %s\n", mrr)
 
 	if len(queryIDs) > 0 {
-		PrintQueries(queryIDs, queriesIsSelected, allQueriesPassageIDs, currentTopKPassagesPerQueryPassageIDs)
+		PrintQueries(queryIDs, queriesIsSelected, allQueriesPassageIDs, topKPassagesPerQuery)
 	}
 }
 
