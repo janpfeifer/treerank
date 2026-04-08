@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"unsafe"
 
 	"github.com/edsrzf/mmap-go"
 	"github.com/gomlx/gomlx/backends"
@@ -23,7 +24,7 @@ const (
 type DataManager struct {
 	QueriesMMap         mmap.MMap
 	PassagesMMap        mmap.MMap
-	QueryIndicesMMap    mmap.MMap
+	QueriesPassageIDs   mmap.MMap
 	QueryIsSelectedMMap mmap.MMap
 
 	NumQueries  int
@@ -57,12 +58,12 @@ func New(dataPath string) (*DataManager, error) {
 		return nil, fmt.Errorf("failed to mmap passages.bin: %w", err)
 	}
 
-	queryIndicesMMap, err := openMMap("query_indices.bin")
+	queryPassageIDsMMap, err := openMMap("queries_passage_ids.bin")
 	if err != nil {
 		return nil, fmt.Errorf("failed to mmap query_indices.bin: %w", err)
 	}
 
-	queryIsSelectedMMap, err := openMMap("query_is_selected.bin")
+	queryIsSelectedMMap, err := openMMap("queries_is_selected.bin")
 	if err != nil {
 		return nil, fmt.Errorf("failed to mmap query_is_selected.bin: %w", err)
 	}
@@ -73,7 +74,7 @@ func New(dataPath string) (*DataManager, error) {
 	return &DataManager{
 		QueriesMMap:         queriesMMap,
 		PassagesMMap:        passagesMMap,
-		QueryIndicesMMap:    queryIndicesMMap,
+		QueriesPassageIDs:   queryPassageIDsMMap,
 		QueryIsSelectedMMap: queryIsSelectedMMap,
 		NumQueries:          numQueries,
 		NumPassages:         numPassages,
@@ -89,7 +90,7 @@ func (d *DataManager) Close() error {
 	if err := d.PassagesMMap.Unmap(); err != nil && firstErr == nil {
 		firstErr = err
 	}
-	if err := d.QueryIndicesMMap.Unmap(); err != nil && firstErr == nil {
+	if err := d.QueriesPassageIDs.Unmap(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := d.QueryIsSelectedMMap.Unmap(); err != nil && firstErr == nil {
@@ -98,14 +99,16 @@ func (d *DataManager) Close() error {
 	return firstErr
 }
 
-// LoadQueryIndices loads the indices of the passages for each query.
-func (d *DataManager) LoadQueryIndices(backend backends.Backend) (*tensors.Tensor, error) {
+// LoadQueriesPassageIDs loads the IDs (indices) of the passages for each query.
+// The returned tensor has shape [NumQueries, 10].
+// It returns -1 for missing passages, when a query doesn't have the 10 passages.
+func (d *DataManager) LoadQueriesPassageIDs(backend backends.Backend) (*tensors.Tensor, error) {
 	shape := shapes.Make(dtypes.Int32, d.NumQueries, PassagesPerQuery)
-	return tensors.FromRaw(backend, 0, shape, []byte(d.QueryIndicesMMap))
+	return tensors.FromRaw(backend, 0, shape, []byte(d.QueriesPassageIDs))
 }
 
-// LoadQueryIsSelected loads the is_selected flags for each passage of a query.
-func (d *DataManager) LoadQueryIsSelected(backend backends.Backend) (*tensors.Tensor, error) {
+// LoadQueriesIsSelected loads the is_selected flags for each passage of a query.
+func (d *DataManager) LoadQueriesIsSelected(backend backends.Backend) (*tensors.Tensor, error) {
 	shape := shapes.Make(dtypes.Int8, d.NumQueries, PassagesPerQuery)
 	return tensors.FromRaw(backend, 0, shape, []byte(d.QueryIsSelectedMMap))
 }
@@ -215,4 +218,50 @@ func (d *DataManager) LoadPassagesBatch(backend backends.Backend, firstPassageID
 	end := (firstPassageID + batchSize) * EmbeddingByteSize
 	shape := shapes.Make(dtypes.Float32, batchSize, EmbeddingSize)
 	return tensors.FromRaw(backend, 0, shape, []byte(d.PassagesMMap)[start:end])
+}
+
+// LoadPassagesForQueries loads the passages for the queries indexed by queryIDs (indices in the full dataset).
+//
+// It returns two tensors:
+//
+//   - passageIDs: global passage IDs (indices to the whole dataset of passages) for the given queries.
+//     You can feed these to LoadPassagesByIDs to get their embeddings.
+//   - queriesPassageIDs: passage indices, re-mapped to indices into the returned passageIDs,
+//     with -1 indicating no passage for the position, shaped [len(queryIDs), 10].
+//     Note: these IDs are **not global**, but indices relative to the returned passages.
+func (d *DataManager) LoadPassagesForQueries(backend backends.Backend, queryIDs ...int) (passageIDs []int, queriesPassageIDs *tensors.Tensor, err error) {
+	queriesPassageIDsShape := shapes.Make(dtypes.Int32, len(queryIDs), PassagesPerQuery)
+	queriesPassageIDs, err = tensors.FromShapeForBackend(backend, 0, queriesPassageIDsShape)
+	passageIDs = make([]int, 0, len(queryIDs)*PassagesPerQuery) // Reserve 10 (PassagesPerQuery) per query.
+	tensors.MutableFlatData(queriesPassageIDs, func(flatQueriesPassageIDs []int32) {
+		flatAllQueryPassageIDs := dtypes.UnsafeSliceFromBytes[int32](unsafe.Pointer(unsafe.SliceData([]byte(d.QueriesPassageIDs))), d.NumPassages)
+		for queryIdx, queryID := range queryIDs {
+			globalQueryPassageIDs := flatAllQueryPassageIDs[queryID*PassagesPerQuery : (queryID+1)*PassagesPerQuery]
+			for passageIdx, passageID := range globalQueryPassageIDs {
+				if passageID >= 0 {
+					flatQueriesPassageIDs[queryIdx*PassagesPerQuery+passageIdx] = int32(len(passageIDs)) // Index to list of passageIDs.
+					passageIDs = append(passageIDs, int(passageID))
+				} else {
+					flatQueriesPassageIDs[queryIdx*PassagesPerQuery+passageIdx] = -1 // No passage for this position.
+				}
+			}
+		}
+	})
+	return
+}
+
+// LoadIsSelectedForQueries loads the is_selected flags for the queries indexed by queryIDs (indices in the full dataset).
+// It's a sub-set of what you get from LoadQueryIsSelected, but gathering only the rows for the given queryIDs.
+func (d *DataManager) LoadIsSelectedForQueries(backend backends.Backend, queryIDs ...int) (queriesIsSelected *tensors.Tensor, err error) {
+	queriesIsSelectedShape := shapes.Make(dtypes.Int8, len(queryIDs), PassagesPerQuery)
+	queriesIsSelected, err = tensors.FromShapeForBackend(backend, 0, queriesIsSelectedShape)
+	tensors.MutableFlatData(queriesIsSelected, func(flatQueriesIsSelected []int8) {
+		flatAllQueryIsSelected := dtypes.UnsafeSliceFromBytes[int8](unsafe.Pointer(unsafe.SliceData([]byte(d.QueryIsSelectedMMap))), d.NumQueries)
+		for queryIdx, queryID := range queryIDs {
+			globalQueryIsSelected := flatAllQueryIsSelected[queryID*PassagesPerQuery : (queryID+1)*PassagesPerQuery]
+			subsetQueryIsSelected := flatQueriesIsSelected[queryIdx*PassagesPerQuery : (queryIdx+1)*PassagesPerQuery]
+			copy(subsetQueryIsSelected, globalQueryIsSelected)
+		}
+	})
+	return
 }

@@ -116,9 +116,9 @@ func main() {
 	defer fQueries.Close()
 	fPassages := openBin("passages.bin")
 	defer fPassages.Close()
-	fQueryIndices := openBin("query_indices.bin")
+	fQueryIndices := openBin("queries_passage_ids.bin")
 	defer fQueryIndices.Close()
-	fQueryIsSelected := openBin("query_is_selected.bin")
+	fQueryIsSelected := openBin("queries_is_selected.bin")
 	defer fQueryIsSelected.Close()
 	passageToID := make(map[string]int32, 1000)
 

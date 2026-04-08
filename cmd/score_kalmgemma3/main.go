@@ -16,7 +16,7 @@ import (
 	"github.com/gomlx/gomlx/pkg/core/shapes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
 	"github.com/gomlx/gomlx/pkg/support/humanize"
-	"github.com/janpfeifer/treerank/internal/datamanager"
+	"github.com/janpfeifer/treerank/pkg/datamanager"
 	"github.com/parquet-go/parquet-go"
 	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
@@ -60,20 +60,17 @@ func main() {
 	}
 
 	// Investigate the distribution of selected passages per query.
-	queryIsSelected := must1(dm.LoadQueryIsSelected(backend))
-	PrintCountNumberSelected(backend, queryIsSelected)
-	if len(queryIDs) > 0 {
-		queryIsSelected = must1(ExecOnce(backend, func(queryIsSelected, queriesToScore *Node) *Node {
-			return Gather(queryIsSelected, ExpandAxes(queriesToScore, -1))
-		}, queryIsSelected, queryIDs))
-		if queryIsSelected.Rank() != 2 && queryIsSelected.Shape().Dim(0) != len(queryIDs) {
-			klog.Exitf("Expected %d queries selected, got %s", len(queryIDs), queryIsSelected.Shape())
-		}
+	var queriesIsSelected *tensors.Tensor
+	if len(queryIDs) == 0 {
+		queriesIsSelected = must1(dm.LoadQueriesIsSelected(backend))
+	} else {
+		queriesIsSelected = must1(dm.LoadIsSelectedForQueries(backend, queryIDs...))
 	}
+	PrintCountNumberSelected(backend, queriesIsSelected)
 
 	// Update MRR computation by selecting the topK passages for each query.
 	const K = 10
-	updateMRRExec := must1(NewExec(backend, func(queries, passagesBatch, passagesBaseIdx, currentTopKPassagesPerQueryIndices, currentTopKPassagesPerQueryScores *Node) (*Node, *Node) {
+	updateMRRExec := must1(NewExec(backend, func(queries, passagesBatch, passagesBatchBaseID, currentTopKPassagesPerQueryPassageIDs, currentTopKPassagesPerQueryScores *Node) (*Node, *Node) {
 		// fmt.Printf("Shapes: %s, %s, %s, %s, %s\n", queries.Shape(), passagesBatch.Shape(), passagesBaseIdx.Shape(), currentTopKPassagesPerQueryIndices.Shape(), currentTopKPassagesPerQueryScores.Shape())
 		g := queries.Graph()
 		dtype := queries.DType()
@@ -85,8 +82,8 @@ func main() {
 		currentTopKPassagesPerQueryScores = Concatenate([]*Node{currentTopKPassagesPerQueryScores, newScores}, -1) // [NumQueries, K + NumPassagesBatch]
 
 		// 2. Indices for the new batch:
-		newIndices := Add(Iota(g, shapes.Make(dtypes.Int32, numQueries, numPassagesBatch), 1), passagesBaseIdx)
-		currentTopKPassagesPerQueryIndices = Concatenate([]*Node{currentTopKPassagesPerQueryIndices, newIndices}, -1) // [NumQueries, K + NumPassagesBatch]
+		newIndices := Add(Iota(g, shapes.Make(dtypes.Int32, numQueries, numPassagesBatch), 1), passagesBatchBaseID)
+		currentTopKPassagesPerQueryPassageIDs = Concatenate([]*Node{currentTopKPassagesPerQueryPassageIDs, newIndices}, -1) // [NumQueries, K + NumPassagesBatch]
 
 		// 4. Sort currentTopK... by their descending scores (similarity)
 		compareScores := NewClosure(g, func(g *Graph) []*Node {
@@ -96,17 +93,17 @@ func main() {
 			_ = Parameter(g, "rhsIndex", shapes.Make(dtypes.Int32))
 			return []*Node{GreaterThan(lhsScore, rhsScore)}
 		})
-		sorted := SortFunc(compareScores, 1, false, currentTopKPassagesPerQueryScores, currentTopKPassagesPerQueryIndices)
+		sorted := SortFunc(compareScores, 1, false, currentTopKPassagesPerQueryScores, currentTopKPassagesPerQueryPassageIDs)
 		currentTopKPassagesPerQueryScores = sorted[0]
-		currentTopKPassagesPerQueryIndices = sorted[1]
+		currentTopKPassagesPerQueryPassageIDs = sorted[1]
 
 		// 5. Truncate to take only the TopK
 		if currentTopKPassagesPerQueryScores.Shape().Dim(1) > K {
 			currentTopKPassagesPerQueryScores = Slice(currentTopKPassagesPerQueryScores, AxisRange(), AxisRangeFromStart(K))
-			currentTopKPassagesPerQueryIndices = Slice(currentTopKPassagesPerQueryIndices, AxisRange(), AxisRangeFromStart(K))
+			currentTopKPassagesPerQueryPassageIDs = Slice(currentTopKPassagesPerQueryPassageIDs, AxisRange(), AxisRangeFromStart(K))
 		}
 
-		return currentTopKPassagesPerQueryIndices, currentTopKPassagesPerQueryScores
+		return currentTopKPassagesPerQueryPassageIDs, currentTopKPassagesPerQueryScores
 	}))
 
 	// Load queries.
@@ -119,7 +116,7 @@ func main() {
 	const passagesBatchSize = 32
 
 	// currentTopKPassagesPerQuery starts with 0 passages selected, and keeps being updated with the topK for each batch.
-	currentTopKPassagesPerQueryIndices := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Int32, queries.Shape().Dim(0), 0)))
+	currentTopKPassagesPerQueryPassageIDs := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Int32, queries.Shape().Dim(0), 0)))
 	currentTopKPassagesPerQueryScores := must1(tensors.FromShapeForBackend(backend, 0, shapes.Make(dtypes.Float32, queries.Shape().Dim(0), 0)))
 	start := time.Now()
 	lastUpdate := start
@@ -151,9 +148,9 @@ func main() {
 		}
 		thisBatchSize := min(passagesBatchSize, dm.NumPassages-passagesBaseIdx)
 		passagesBatch := must1(dm.LoadPassagesBatch(backend, passagesBaseIdx, thisBatchSize))
-		currentTopKPassagesPerQueryIndices, currentTopKPassagesPerQueryScores = must2(updateMRRExec.Exec2(
+		currentTopKPassagesPerQueryPassageIDs, currentTopKPassagesPerQueryScores = must2(updateMRRExec.Exec2(
 			queries, passagesBatch, int32(passagesBaseIdx),
-			must1(DonateTensorBuffer(currentTopKPassagesPerQueryIndices, backend, 0)),
+			must1(DonateTensorBuffer(currentTopKPassagesPerQueryPassageIDs, backend, 0)),
 			must1(DonateTensorBuffer(currentTopKPassagesPerQueryScores, backend, 0))))
 	}
 	printStatusFn()
@@ -162,14 +159,14 @@ func main() {
 	updateMRRExec.Finalize()
 
 	// Load queryIndices: map of queryID -> list of passageIDs
-	allQueryIndices := must1(dm.LoadQueryIndices(backend))
-	queryIndices := allQueryIndices
+	allQueriesPassageIDs := must1(dm.LoadQueriesPassageIDs(backend))
+	queryPassageIDs := allQueriesPassageIDs
 	if len(queryIDs) > 0 {
-		queryIndices = must1(ExecOnce(backend, func(queryIndices, queryIDs *Node) *Node {
+		queryPassageIDs = must1(ExecOnce(backend, func(queryIndices, queryIDs *Node) *Node {
 			return Gather(queryIndices, ExpandAxes(queryIDs, -1))
-		}, queryIndices, queryIDs))
-		if queryIndices.Rank() != 2 && queryIndices.Shape().Dim(0) != len(queryIDs) {
-			klog.Exitf("Expected %d queries indices, got %s", len(queryIDs), queryIndices.Shape())
+		}, queryPassageIDs, queryIDs))
+		if queryPassageIDs.Rank() != 2 && queryPassageIDs.Shape().Dim(0) != len(queryIDs) {
+			klog.Exitf("Expected %d queries indices, got %s", len(queryIDs), queryPassageIDs.Shape())
 		}
 	}
 
@@ -210,11 +207,11 @@ func main() {
 		validQueries = Max(validQueries, oneFloat)                                               // Avoid division by zero.
 		mrr := Div(ReduceSum(rrScores), validQueries)
 		return mrr
-	}, queryIndices, queryIsSelected, currentTopKPassagesPerQueryIndices))
+	}, queryPassageIDs, queriesIsSelected, currentTopKPassagesPerQueryPassageIDs))
 	fmt.Printf("MRR: %s\n", mrr)
 
 	if len(queryIDs) > 0 {
-		PrintQueries(queryIDs, queryIsSelected, allQueryIndices, currentTopKPassagesPerQueryIndices)
+		PrintQueries(queryIDs, queriesIsSelected, allQueriesPassageIDs, currentTopKPassagesPerQueryPassageIDs)
 	}
 }
 
