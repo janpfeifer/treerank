@@ -4,10 +4,14 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"hash/maphash"
 	"math/bits"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
@@ -40,6 +44,7 @@ var (
 	flagTask         = flag.String("task", "MSMARCO", "Task selection (for queries), it adds a prompt accordingly. "+
 		"If empty no prompt is prepended. "+
 		"Set to '?' or 'list' to list supported values.")
+	flagResume = flag.Bool("resume", false, "Resume generation from where it stopped.")
 )
 
 type Work struct {
@@ -105,7 +110,11 @@ func main() {
 	}
 
 	openBin := func(name string) *os.File {
-		f, err := os.OpenFile(filepath.Join(splitDir, name), os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+		flags := os.O_CREATE | os.O_RDWR
+		if !*flagResume {
+			flags |= os.O_TRUNC
+		}
+		f, err := os.OpenFile(filepath.Join(splitDir, name), flags, 0644)
 		if err != nil {
 			klog.Fatalf("Failed to create file %s: %v", name, err)
 		}
@@ -120,13 +129,54 @@ func main() {
 	defer fQueryIndices.Close()
 	fQueryIsSelected := openBin("queries_is_selected.bin")
 	defer fQueryIsSelected.Close()
-	passageToID := make(map[string]int32, 1000)
+	var passageDict *PassageDictionary
+	var numQueriesRead int32
+
+	if *flagResume {
+		dictPath := filepath.Join(splitDir, "passage_dictionary.bin")
+		var err error
+		passageDict, err = LoadPassageDictionary(dictPath)
+		if err != nil {
+			klog.Fatalf("Failed to load passage dictionary: %v", err)
+		}
+
+		qStat, _ := fQueries.Stat()
+		nq1 := qStat.Size() / (3840 * 4) // embeddingDim * 4 bytes
+
+		qiStat, _ := fQueryIndices.Stat()
+		nq2 := qiStat.Size() / 40 // 10 int32s = 40 bytes
+
+		qsStat, _ := fQueryIsSelected.Stat()
+		nq3 := qsStat.Size() / 10 // 10 bytes = 10 bytes
+
+		if nq1 != nq2 || nq1 != nq3 {
+			klog.Fatalf("Cannot resume: inconsistent file sizes! queries.bin=%d, indices=%d, selected=%d queries", nq1, nq2, nq3)
+		}
+
+		numQueriesRead = int32(nq1)
+		fmt.Printf("- Resuming generation from query %d (loaded %d passages from dictionary).\n", numQueriesRead, passageDict.Len())
+
+		if _, err := fQueryIndices.Seek(int64(numQueriesRead)*40, 0); err != nil {
+			klog.Fatalf("Failed to seek queries_passage_ids.bin: %v", err)
+		}
+		if _, err := fQueryIsSelected.Seek(int64(numQueriesRead)*10, 0); err != nil {
+			klog.Fatalf("Failed to seek queries_is_selected.bin: %v", err)
+		}
+
+		pStat, _ := fPassages.Stat()
+		np := pStat.Size() / (3840 * 4)
+		if np < int64(passageDict.Len()) {
+			klog.Fatalf("Cannot resume: passages.bin size (%d embeddings) is surprisingly smaller than dictionary size (%d)", np, passageDict.Len())
+		}
+	} else {
+		passageDict = NewPassageDictionary()
+	}
 
 	// Structured concurrency (keep track of goroutines).
 	var wg sync.WaitGroup
 
 	// Start bucket runner in a separate goroutine.
-	bucketsInputChan := make(chan bucket.SentenceRef)
+	bucketsInputChan := make(chan bucket.SentenceRef, 5)
 	bucketsOutputChan := make(chan bucket.Bucket, 10)
 	bkt := bucket.New(tokenizer).
 		ByTwoBitBucketBudget(8*1024, 16).
@@ -138,8 +188,6 @@ func main() {
 	// Dataset preparation and stats.
 	ds := datasets.New(msmarco.ID)
 	limit := *flagLimit
-	var numQueriesRead int32
-	var numPassagesRead int32
 	dsInfo, err := ds.Info()
 	if err != nil {
 		klog.Fatalf("Failed to get dataset info: %v", err)
@@ -157,12 +205,43 @@ func main() {
 		limit = min(limit, int(totalQueries))
 	}
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	var interrupted atomic.Bool
+
+	var wgInterrupt sync.WaitGroup
+	wgInterrupt.Go(func() {
+		_, ok := <-sigChan
+		if !ok {
+			return
+		}
+		fmt.Printf("\n🛑 Interrupted: stopping reading dataset early, flushing buffers (it will take a minute or so). " +
+			"\n   Interrupt again (control+C) to abort immediately and lose all progress.\n")
+		interrupted.Store(true)
+
+		_, ok = <-sigChan
+		if !ok {
+			return
+		}
+		fmt.Printf("\n🛑 Interrupted again: aborting immediately! Anything saved can't be resumed later.\n")
+		os.Exit(1)
+	})
+
 	// Start goroutine that feeds the bucket runner with queries and passages.
 	// It also sequentially saves the fQueryIndices and fQueryIsSelected files.
 	wg.Go(func() {
 		defer close(bucketsInputChan)
-		count := 0
-		for record, err := range datasets.IterParquetFromDataset[msmarco.MsMarcoRecord](ds, msmarco.Config, *flagMSMarcoSplit) {
+		if limit > 0 && int(numQueriesRead) >= limit {
+			fmt.Printf("- Target limit of %d queries already reached.\n", limit)
+			return
+		}
+
+		startAt := int64(numQueriesRead)
+		for record, err := range datasets.IterParquetFromDatasetAt[msmarco.MsMarcoRecord](ds, msmarco.Config, *flagMSMarcoSplit, startAt) {
+			if interrupted.Load() {
+				break
+			}
+
 			if err != nil {
 				klog.Fatalf("Dataset iterator error: %v", err)
 			}
@@ -195,11 +274,8 @@ func main() {
 				}
 
 				// Registers new passage if it doesn't exist yet.
-				passageID, exists := passageToID[text]
-				if !exists {
-					passageID = numPassagesRead
-					numPassagesRead++
-					passageToID[text] = passageID
+				passageID, isNew := passageDict.GetOrAdd(text)
+				if isNew {
 					bucketsInputChan <- bucket.SentenceRef{
 						Sentence:  text,
 						Reference: Work{IsQuery: false, ID: passageID},
@@ -218,8 +294,7 @@ func main() {
 				klog.Fatalf("Failed to write is selected: %v", err)
 			}
 
-			count++
-			if limit > 0 && count >= limit {
+			if limit > 0 && int(numQueriesRead) >= limit {
 				break
 			}
 		}
@@ -237,6 +312,8 @@ func main() {
 	if expectedNumQueries <= 0 {
 		expectedNumQueries = int(totalQueries)
 	}
+	initialQueriesProcessed := int(numQueriesRead)
+	initialSentencesProcessed := initialQueriesProcessed + passageDict.Len()
 	var emaSpeed float64
 	var emaInitialized bool
 
@@ -244,7 +321,7 @@ func main() {
 
 		fmt.Printf("- Starting processing:\n")
 		lastReportTime := time.Now()
-		var queriesPerSecond float64
+		var sentencesPerSecond float64
 		for bk := range bucketsOutputChan {
 			if bk.Error != nil {
 				klog.Fatalf("Tokenization error: %v", bk.Error)
@@ -339,19 +416,23 @@ func main() {
 				lastReportTime = time.Now()
 
 				// ETA estimation.
-				queriesPerSecond = float64(numQueriesProcessed) / time.Since(startTime).Seconds()
+				sentencesPerSecond = float64(numSentencesProcessed) / time.Since(startTime).Seconds()
 				eta := "Unknown"
+				totalSentences := initialSentencesProcessed + numSentencesProcessed
+				expectedTotalSentences := 11 * expectedNumQueries
 				if numQueriesProcessed > 0 {
-					remainingSeconds := float64(expectedNumQueries-numQueriesProcessed) / queriesPerSecond
+					remainingSeconds := float64(expectedTotalSentences-totalSentences) / sentencesPerSecond
 					eta = humanize.Duration(time.Duration(int64(remainingSeconds*1e9)) * time.Nanosecond)
 				}
-				fmt.Printf("\r  - Processed %s / %s queries (%s, %s non-padding) -- ETA %s ...%s",
-					humanize.Count(int64(numQueriesProcessed)), humanize.Count(int64(expectedNumQueries)), humanize.Speed(queriesPerSecond, "queries"),
+				fmt.Printf("\r   - Processed %s / %s queries+passages (%s, %s non-padding) -- ETA %s ...%s",
+					humanize.Count(int64(totalSentences)), humanize.Count(int64(expectedTotalSentences)), humanize.Speed(sentencesPerSecond, "queries+passages"),
 					humanize.Speed(emaSpeed, "tokens"), eta, humanize.EraseToEndOfLine)
 			}
 		}
-		fmt.Printf("\r  - Processed %s / %s queries (%s, %s non-padding) -- done.%s\n",
-			humanize.Count(int64(numQueriesProcessed)), humanize.Count(int64(expectedNumQueries)), humanize.Speed(queriesPerSecond, "queries"),
+		totalSentences := initialSentencesProcessed + numSentencesProcessed
+		expectedTotalSentences := 11 * expectedNumQueries
+		fmt.Printf("\r  ✅ Processed %s / %s queries+passages (%s, %s non-padding) -- done.%s\n",
+			humanize.Count(int64(totalSentences)), humanize.Count(int64(expectedTotalSentences)), humanize.Speed(sentencesPerSecond, "queries+passages"),
 			humanize.Speed(emaSpeed, "tokens"), humanize.EraseToEndOfLine)
 	})
 
@@ -359,12 +440,20 @@ func main() {
 	elapsed := time.Since(startTime)
 	fmt.Printf("Total duration: %v\n", humanize.Duration(elapsed))
 
+	// Save passage dictionary, if one wants to continue or merge datasets later.
+	dictPath := filepath.Join(splitDir, "passage_dictionary.bin")
+	fmt.Printf("- Saving PassageDictionary to %q\n", dictPath)
+	if err := passageDict.Save(dictPath); err != nil {
+		klog.Errorf("Failed to save passage dictionary: %v", err)
+	}
+
 	// Print nice report table with counts and speeds.
+	numPassagesRead := passageDict.Len()
 	names := []string{"Queries", "Passages", "Tokens", "Non-Pad Tokens"}
 	totals := []string{humanize.Count(int64(numQueriesRead)), humanize.Count(int64(numPassagesRead)), humanize.Count(numTokensProcessed), humanize.Count(numNonPadTokensProcessed)}
 	speeds := []string{
-		humanize.Speed(float64(numQueriesRead)/elapsed.Seconds(), " items"),
-		humanize.Speed(float64(numPassagesRead)/elapsed.Seconds(), " items"),
+		humanize.Speed(float64(numQueriesProcessed)/elapsed.Seconds(), " items"),
+		humanize.Speed(float64(numSentencesProcessed-numQueriesProcessed)/elapsed.Seconds(), " items"),
 		humanize.Speed(float64(numTokensProcessed)/elapsed.Seconds(), "tokens"),
 		humanize.Speed(float64(numNonPadTokensProcessed)/elapsed.Seconds(), "tokens"),
 	}
@@ -391,6 +480,10 @@ func main() {
 		t.Row(names[i], totals[i], speeds[i])
 	}
 	fmt.Println(t)
+
+	signal.Stop(sigChan)
+	close(sigChan)
+	wgInterrupt.Wait()
 }
 
 func mustRunWithElapsedTime[T any](name string, f func() (T, error)) T {
@@ -435,4 +528,85 @@ func taskSelection(repo *hub.Repo) kalmgemma3.TaskPrompts {
 		klog.Fatalf("Unknown task prompt key: %s", *flagTask)
 	}
 	return taskPrompts
+}
+
+// PassageDictionary encapsulates mapping of passages to unique integer IDs.
+type PassageDictionary struct {
+	mapPassages map[uint64]int32
+	hasher      maphash.Hash
+}
+
+func NewPassageDictionary() *PassageDictionary {
+	return &PassageDictionary{
+		mapPassages: make(map[uint64]int32, 1000),
+	}
+}
+
+func (pd *PassageDictionary) GetOrAdd(text string) (id int32, isNew bool) {
+	pd.hasher.Reset()
+	pd.hasher.WriteString(text)
+	hash := pd.hasher.Sum64()
+
+	var ok bool
+	id, ok = pd.mapPassages[hash]
+	if !ok {
+		id = int32(len(pd.mapPassages))
+		pd.mapPassages[hash] = id
+		isNew = true
+	}
+	return
+}
+
+func (pd *PassageDictionary) Len() int {
+	return len(pd.mapPassages)
+}
+
+func (pd *PassageDictionary) Save(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	size := int64(len(pd.mapPassages))
+	if err := binary.Write(f, binary.LittleEndian, size); err != nil {
+		return err
+	}
+
+	for hash, id := range pd.mapPassages {
+		if err := binary.Write(f, binary.LittleEndian, hash); err != nil {
+			return err
+		}
+		if err := binary.Write(f, binary.LittleEndian, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func LoadPassageDictionary(path string) (*PassageDictionary, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	pd := NewPassageDictionary()
+	var size int64
+	if err := binary.Read(f, binary.LittleEndian, &size); err != nil {
+		return nil, err
+	}
+
+	for i := int64(0); i < size; i++ {
+		var hash uint64
+		var id int32
+		if err := binary.Read(f, binary.LittleEndian, &hash); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(f, binary.LittleEndian, &id); err != nil {
+			return nil, err
+		}
+		pd.mapPassages[hash] = id
+	}
+	return pd, nil
 }

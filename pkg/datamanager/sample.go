@@ -18,18 +18,18 @@ import (
 // SampleQueriesAndPassages samples numQueries and their associated passages, along with topKPassages and random passages
 // up to numPassages. It returns the sampled queries, passages, and re-mapped querying tensors.
 func (d *DataManager) SampleQueriesAndPassages(backend backends.Backend, numQueries, numPassages, topKPassages int) (
-	queries, passages, queriesIsSelected, queriesPassageIDs *tensors.Tensor, err error) {
-	// (A) Sample queryIDs
-	queryIDs := d.SampleQueries(numQueries, numPassages)
+	globalQueryIDs []int, queries, passages, queriesIsSelected, queriesPassageIDs *tensors.Tensor, err error) {
+	// (A) Sample globalQueryIDs
+	globalQueryIDs = d.SampleQueries(numQueries)
 
 	// Load queries
-	queries, err = d.LoadQueriesByIDs(backend, queryIDs...)
+	queries, err = d.LoadQueriesByIDs(backend, globalQueryIDs...)
 	if err != nil {
 		return
 	}
 
 	// Load queriesIsSelected
-	queriesIsSelected, err = d.LoadIsSelectedForQueries(backend, queryIDs...)
+	queriesIsSelected, err = d.LoadIsSelectedForQueries(backend, globalQueryIDs...)
 	if err != nil {
 		return
 	}
@@ -38,7 +38,9 @@ func (d *DataManager) SampleQueriesAndPassages(backend backends.Backend, numQuer
 	passageIDsSet := sets.Make[int32](numPassages)
 
 	// Add passages directly associated with the sampled queries
-	associatedPassageIDsLocal, originalQueriesPassageIDsLocal, err := d.LoadPassagesForQueries(backend, queryIDs...)
+	var associatedPassageIDsLocal []int
+	var originalQueriesPassageIDsLocal *tensors.Tensor
+	associatedPassageIDsLocal, originalQueriesPassageIDsLocal, err = d.LoadPassagesForQueries(backend, globalQueryIDs...)
 	if err != nil {
 		return
 	}
@@ -107,7 +109,6 @@ func (d *DataManager) SampleQueriesAndPassages(backend backends.Backend, numQuer
 	}
 
 	queriesPassageIDs = tensors.FromFlatDataAndDimensions(flatQueriesPassageIDs, numQueries, PassagesPerQuery)
-
 	return
 }
 
@@ -117,7 +118,7 @@ func (d *DataManager) SampleQueriesAndPassages(backend backends.Backend, numQuer
 //
 //   - queryIDs: global IDs (indices in the set of all queries in the dataset) of the sampled queries.
 //     They are unique and sorted in ascending order.
-func (d *DataManager) SampleQueries(numQueries, numPassages int) (queryIDs []int) {
+func (d *DataManager) SampleQueries(numQueries int) (queryIDs []int) {
 	queryIDSet := sets.Make[int](numQueries)
 	for len(queryIDSet) < numQueries {
 		queryID := rand.IntN(d.NumQueries)
